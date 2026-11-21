@@ -38,6 +38,10 @@ pub const DECODE_FIR_TAPS: usize = 127;
 pub const PLL_LOOP_BW_HZ: f32 = 1.0e6;
 pub const PLL_AUTO_MIN_SAMPLE_RATE_HZ: u32 = 25_000_000;
 const FIR_TRANSITION_K: f32 = 2.33;
+/// Largest FM deviation a [`DecodePlan`] accepts. Analog FPV deviates by
+/// a few MHz; 1 GHz is far past any real link and far short of where
+/// `f32` arithmetic on it overflows.
+pub const MAX_FM_DEVIATION_HZ: f32 = 1.0e9;
 
 /// The requested demodulation mode, resolved after choosing the working rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +126,12 @@ impl DecodePlan {
             return Err(DecodeConfigError(
                 "FM deviation must be finite and positive",
             ));
+        }
+        // Finite is not enough: the cutoff, the PLL's pull range and the
+        // sync thresholds are all small multiples of the deviation, and
+        // near `f32::MAX` those multiples are infinite.
+        if fm_deviation > MAX_FM_DEVIATION_HZ {
+            return Err(DecodeConfigError("FM deviation must be at most 1 GHz"));
         }
         if !bandwidth_hz.is_finite() || bandwidth_hz <= 0.0 {
             return Err(DecodeConfigError(
@@ -329,6 +339,11 @@ impl StreamingFpvDecoder {
         if discontinuous {
             self.reset_discontinuity();
         }
+        // NaN, infinity and finite-but-overflowing samples would all end
+        // up as NaN in the discriminator and then in every filter with
+        // memory behind it. Borrowed, not copied, for a clean chunk.
+        let sanitized = crate::types::sanitize_iq(samples);
+        let samples: &[Complex<f32>] = &sanitized;
         let start = self.profiling.then(Instant::now);
         self.shifted_iq.clear();
         if self.pll.is_none()
@@ -581,6 +596,73 @@ mod tests {
     fn explicit_demod_choices_ignore_the_heuristic() {
         assert!(DemodulationMode::Pll.use_pll(15_360_000, 5_000_000.0));
         assert!(!DemodulationMode::Discriminator.use_pll(61_440_000, 100_000.0));
+    }
+
+    /// A deviation near `f32::MAX` is finite, but `deviation * 1.2` is
+    /// not, and the PLL constructor asserts on it: the plan has to
+    /// refuse it first.
+    #[test]
+    fn an_absurd_deviation_is_a_config_error_not_a_panic() {
+        for mode in [DemodulationMode::Auto, DemodulationMode::Pll] {
+            assert!(DecodePlan::new(30_720_000, 3.0e38, 14e6, mode).is_err());
+            assert!(DecodePlan::new(30_720_000, 2.0 * MAX_FM_DEVIATION_HZ, 14e6, mode).is_err());
+        }
+        // The bound itself is usable end to end, PLL included.
+        let plan =
+            DecodePlan::new(30_720_000, MAX_FM_DEVIATION_HZ, 14e6, DemodulationMode::Pll).unwrap();
+        assert!(
+            StreamingFpvDecoder::new(DecoderConfig {
+                plan,
+                frequency_offset_hz: 0.0,
+                standard: Standard::Ntsc,
+                deemphasis_tau_s: 0.15e-6,
+                temporal_window: 1,
+                debug: false,
+            })
+            .is_ok()
+        );
+    }
+
+    /// An overflowing sample makes the discriminator's product NaN, and
+    /// a NaN held by the deemphasis filter or the PLL would make every
+    /// later sample NaN until the next source gap.
+    #[test]
+    fn hostile_samples_do_not_poison_the_decoder() {
+        for mode in [DemodulationMode::Discriminator, DemodulationMode::Pll] {
+            let plan = DecodePlan::new(30_720_000, 5e6, 14e6, mode).unwrap();
+            let mut decoder = StreamingFpvDecoder::new(DecoderConfig {
+                plan,
+                frequency_offset_hz: 250_000.0,
+                standard: Standard::Ntsc,
+                deemphasis_tau_s: 0.15e-6,
+                temporal_window: 1,
+                debug: false,
+            })
+            .unwrap();
+            let tone = |n: usize| -> Vec<Complex<f32>> {
+                (0..n)
+                    .map(|i| Complex::from_polar(1.0, 0.3 * i as f32))
+                    .collect()
+            };
+            let mut hostile = tone(4096);
+            hostile[100] = Complex::new(3.0e38, -3.0e38);
+            hostile[101] = Complex::new(1.0e30, 1.0e30);
+            hostile[200] = Complex::new(f32::NAN, 0.0);
+            hostile[300] = Complex::new(0.0, f32::INFINITY);
+            hostile[301] = Complex::new(f32::NEG_INFINITY, f32::NAN);
+            decoder.push_iq(&hostile, false);
+            assert!(
+                decoder.demodulated_chunk().iter().all(|v| v.is_finite()),
+                "{mode:?}: hostile chunk produced non-finite demod"
+            );
+            decoder.push_iq(&tone(4096), false);
+            let after = decoder.demodulated_chunk();
+            assert!(!after.is_empty());
+            assert!(
+                after.iter().all(|v| v.is_finite()),
+                "{mode:?}: state stayed poisoned after the hostile chunk"
+            );
+        }
     }
 
     /// A degenerate deviation must not select the PLL by accident.

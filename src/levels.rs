@@ -132,9 +132,7 @@ pub(crate) fn median(values: &mut [f32]) -> f32 {
         return 0.0;
     }
     let mid = values.len() / 2;
-    values.select_nth_unstable_by(mid, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    values.select_nth_unstable_by(mid, f32::total_cmp);
     values[mid]
 }
 
@@ -194,9 +192,7 @@ pub(crate) fn robust_sync_levels(smoothed: &[f32]) -> Option<(f32, f32)> {
         return None;
     }
     let p2_idx = (((decimated.len() as f32) * 0.02) as usize).min(decimated.len() - 1);
-    decimated.select_nth_unstable_by(p2_idx, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    decimated.select_nth_unstable_by(p2_idx, f32::total_cmp);
     let p2 = decimated[p2_idx];
     let p50 = median(&mut decimated);
     if !(p2.is_finite() && p50.is_finite()) || p50 <= p2 {

@@ -6,7 +6,7 @@ edition = "2024"
 # Declared so a consumer's MSRV-aware resolution sees the floor.
 rust-version = "1.100"
 description = "Analog FPV drone video signal detection via FM demodulation and spectral sync-pulse analysis."
-repository = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs"
+repository = "https://github.com/isaacbentley/fpv-drone-analog-rs"
 readme = "README.md"
 keywords = ["fpv", "drone", "detection", "sdr", "fm"]
 categories = ["science", "algorithms"]

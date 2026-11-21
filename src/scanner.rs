@@ -175,7 +175,7 @@ pub fn plan_tune_centers(channels_hz: &[f64], span_hz: f64) -> Vec<f64> {
         .copied()
         .filter(|f| f.is_finite())
         .collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(f64::total_cmp);
     sorted.dedup();
 
     let reach = span_hz.max(0.0);

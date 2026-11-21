@@ -106,6 +106,8 @@ pub fn analyze_tuned_channel(
     fallback: SignalType,
 ) -> Result<AcquisitionResult, crate::decode::DecodeConfigError> {
     validate_probe(sample_rate, fm_deviation_hz, center_hz)?;
+    let sanitized = crate::types::sanitize_iq(iq);
+    let iq: &[Complex<f32>] = &sanitized;
     let detector = AnalogFpvDetector::default();
     let passband = fm_deviation_hz + LUMA_HEADROOM_HZ;
     let measured_carrier_hz = carrier_for_decoded_channel(
@@ -161,6 +163,8 @@ pub fn analyze_channel_standard(
     fallback: SignalType,
 ) -> Result<(StandardResolution, f32), crate::decode::DecodeConfigError> {
     validate_probe(sample_rate, deviation_hz, offset_hz as f64)?;
+    let sanitized = crate::types::sanitize_iq(iq);
+    let iq: &[Complex<f32>] = &sanitized;
     let mut ddc = StreamingDDC::new(offset_hz, sample_rate, deviation_hz + LUMA_HEADROOM_HZ);
     let baseband = ddc.process(iq);
     let (tagged, confidence) =

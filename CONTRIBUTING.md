@@ -5,8 +5,8 @@ Local setup and the checks a change has to pass before a pull request.
 ## Quick start
 
 ```bash
-git clone https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git
-cd orecchiette-fpv-drone-analog-rs
+git clone https://github.com/isaacbentley/fpv-drone-analog-rs.git
+cd fpv-drone-analog-rs
 
 cargo test --all-features
 cargo clippy --all-features --all-targets -- -D warnings
@@ -33,6 +33,20 @@ Beyond the three commands above, a pull request also has to satisfy:
 `cargo hack` is the one most easily missed locally: a dependency used
 under one feature but declared unconditionally passes a normal build and
 fails there.
+
+Every action in `.github/workflows/` is pinned to a full commit SHA, with
+the tag it corresponds to in a trailing comment. Dependabot keeps both in
+step; a hand edit has to as well, and `actionlint` should pass.
+
+## Releases
+
+Pushing a `v*` tag starts `release.yml`, which re-runs the gates and then
+publishes to crates.io. The publish job runs in the `crates-io` GitHub
+environment, so it waits for that environment's protection rules
+(Settings → Environments → `crates-io`: required reviewers, and a
+deployment rule limiting it to `v*` tags) before the registry token is
+released to it. `CARGO_REGISTRY_TOKEN` belongs in that environment's
+secrets rather than the repository's.
 
 ## Tests
 

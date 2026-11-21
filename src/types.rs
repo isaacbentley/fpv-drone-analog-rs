@@ -1,5 +1,46 @@
 use crate::bands::FpvChannel;
+use num_complex::Complex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+/// Largest I or Q magnitude the crate's entry points let through.
+///
+/// A finite sample can still be poison: the discriminator multiplies
+/// neighbouring samples, so anything past about 1.8e19 overflows `f32`
+/// to `inf - inf` and comes out NaN, which then sticks in every filter
+/// with memory downstream. 1e9 is far above any real capture (a
+/// normalised stream peaks near 1, an unscaled 16-bit one at 32,768)
+/// and far below where squares and FIR sums overflow.
+pub const MAX_IQ_COMPONENT: f32 = 1.0e9;
+
+/// One sample made safe to process: zero if either part is NaN or
+/// infinite, otherwise each part clamped to ±[`MAX_IQ_COMPONENT`].
+#[inline]
+pub fn sanitize_iq_sample(s: Complex<f32>) -> Complex<f32> {
+    if s.re.is_finite() && s.im.is_finite() {
+        Complex::new(
+            s.re.clamp(-MAX_IQ_COMPONENT, MAX_IQ_COMPONENT),
+            s.im.clamp(-MAX_IQ_COMPONENT, MAX_IQ_COMPONENT),
+        )
+    } else {
+        Complex::new(0.0, 0.0)
+    }
+}
+
+/// `iq` with every sample passed through [`sanitize_iq_sample`].
+///
+/// Borrows when nothing needs changing, which is every real capture, so
+/// the cost on the hot path is one comparison pass and no copy.
+pub fn sanitize_iq(iq: &[Complex<f32>]) -> Cow<'_, [Complex<f32>]> {
+    // One test covers NaN, infinity and out-of-range: every comparison
+    // with NaN is false.
+    let sane = |s: &Complex<f32>| s.re.abs() <= MAX_IQ_COMPONENT && s.im.abs() <= MAX_IQ_COMPONENT;
+    if iq.iter().all(sane) {
+        Cow::Borrowed(iq)
+    } else {
+        Cow::Owned(iq.iter().copied().map(sanitize_iq_sample).collect())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionResult {
@@ -60,5 +101,57 @@ impl SignalType {
                 | SignalType::AnalogVideoPal
                 | SignalType::AnalogVideoUnknown,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_block_is_borrowed_untouched() {
+        let iq = vec![
+            Complex::new(0.5, -0.5),
+            Complex::new(-32_768.0, 32_767.0),
+            Complex::new(MAX_IQ_COMPONENT, -MAX_IQ_COMPONENT),
+            Complex::new(0.0, -0.0),
+        ];
+        let out = sanitize_iq(&iq);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(&*out, &iq[..]);
+        assert!(matches!(sanitize_iq(&[]), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn hostile_samples_are_zeroed_or_clamped() {
+        let iq = [
+            Complex::new(1.0, 2.0),
+            Complex::new(f32::NAN, 2.0),
+            Complex::new(1.0, f32::INFINITY),
+            Complex::new(f32::NEG_INFINITY, f32::NAN),
+            Complex::new(3.0e38, -1.0e30),
+            Complex::new(-2.0e9, 7.0),
+        ];
+        let out = sanitize_iq(&iq);
+        assert_eq!(
+            &*out,
+            &[
+                Complex::new(1.0, 2.0),
+                Complex::new(0.0, 0.0),
+                Complex::new(0.0, 0.0),
+                Complex::new(0.0, 0.0),
+                Complex::new(MAX_IQ_COMPONENT, -MAX_IQ_COMPONENT),
+                Complex::new(-MAX_IQ_COMPONENT, 7.0),
+            ]
+        );
+        // What the bound is for: neighbouring samples multiply in the
+        // discriminator, and that product must stay finite.
+        let worst = Complex::new(MAX_IQ_COMPONENT, MAX_IQ_COMPONENT);
+        assert!((worst * worst.conj()).arg().is_finite());
+        assert!(
+            (worst * Complex::new(-MAX_IQ_COMPONENT, MAX_IQ_COMPONENT))
+                .arg()
+                .is_finite()
+        );
     }
 }

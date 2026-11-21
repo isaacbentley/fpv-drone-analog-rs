@@ -67,6 +67,104 @@ const WORKGROUP_SIZE: u32 = 64;
 /// wgpu's default handler turns that into a process-killing panic.
 const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
 
+/// Why [`GpuAnalog::sweep`] declined a batch. The caller falls back to
+/// the CPU sweep; nothing has been dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuSweepError(pub &'static str);
+
+impl std::fmt::Display for GpuSweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for GpuSweepError {}
+
+/// A sweep's sizes, each proven to fit the type the shader and wgpu take
+/// it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SweepDims {
+    total_iq_len: u32,
+    n_probes: u32,
+    decimation_factor: u32,
+    out_len: u32,
+    /// `n_probes * out_len`: one shader invocation per output sample.
+    total_threads: u32,
+    groups_x: u32,
+    groups_y: u32,
+    /// Bytes of the output (and staging, and phase-table) buffers.
+    output_size: u64,
+}
+
+/// Size a sweep, or say why it cannot run on the GPU.
+///
+/// The conversions are checked because a wrapped one is silent: with
+/// `n_probes * out_len` taken modulo 2^32 the dispatch covers fewer
+/// invocations than the output buffer has slots, and the rest of that
+/// pooled buffer is read back as this sweep's result while still
+/// holding an earlier sweep's samples. The device limits are checked
+/// because wgpu answers a violation with a validation error, which its
+/// default handler turns into a panic.
+///
+/// `max_buffer_bytes` is the smaller of the device's buffer-size and
+/// storage-binding limits; `max_groups_per_dim` its
+/// workgroups-per-dimension limit.
+fn sweep_dims(
+    n: usize,
+    n_probes: usize,
+    decimation_factor: usize,
+    max_buffer_bytes: u64,
+    max_groups_per_dim: u32,
+) -> Result<SweepDims, GpuSweepError> {
+    // The shader indexes input samples as `i32`.
+    let total_iq_len = u32::try_from(n)
+        .ok()
+        .filter(|&len| len <= i32::MAX as u32)
+        .ok_or(GpuSweepError("input is longer than the shader can index"))?;
+    let n_probes_u32 =
+        u32::try_from(n_probes).map_err(|_| GpuSweepError("too many probes for one dispatch"))?;
+    let decimation_factor = u32::try_from(decimation_factor.max(1))
+        .map_err(|_| GpuSweepError("decimation factor does not fit in 32 bits"))?;
+    let out_len = total_iq_len.div_ceil(decimation_factor);
+    let total_threads = n_probes_u32.checked_mul(out_len).ok_or(GpuSweepError(
+        "probes x output samples exceeds one dispatch",
+    ))?;
+
+    // Pooled buffers are created at the next power of two, so that is
+    // the size the device has to accept.
+    let fits = |bytes: u64| {
+        bytes
+            .checked_next_power_of_two()
+            .is_some_and(|cap| cap <= max_buffer_bytes)
+    };
+    let input_size = u64::from(total_iq_len) * 8;
+    let output_size = u64::from(total_threads) * 8;
+    if !fits(input_size) || !fits(output_size) {
+        return Err(GpuSweepError(
+            "sweep buffers exceed the GPU device's limits",
+        ));
+    }
+
+    let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+    let per_dim = max_groups_per_dim.clamp(1, MAX_WORKGROUPS_PER_DIM);
+    let groups_x = groups.clamp(1, per_dim);
+    let groups_y = groups.div_ceil(groups_x);
+    if groups_y > per_dim {
+        return Err(GpuSweepError(
+            "sweep needs more workgroups than the GPU device allows",
+        ));
+    }
+    Ok(SweepDims {
+        total_iq_len,
+        n_probes: n_probes_u32,
+        decimation_factor,
+        out_len,
+        total_threads,
+        groups_x,
+        groups_y,
+        output_size,
+    })
+}
+
 /// GPU compute handle for the wideband sweep's batched DDC. Build once
 /// with [`Self::try_new`] and share via `Arc` across detector instances.
 ///
@@ -292,6 +390,11 @@ impl GpuAnalog {
     /// keeps this accurate across the whole buffer, not just near the
     /// start).
     ///
+    /// Returns [`GpuSweepError`] — before anything is uploaded or
+    /// dispatched — for a batch whose sizes overflow the shader's 32-bit
+    /// indices or the device's buffer and dispatch limits; the caller
+    /// should run that batch on the CPU.
+    ///
     /// Panics on a GPU buffer-map failure. Callers that must survive a
     /// GPU hiccup (e.g. a long-running batch worker) should wrap the
     /// call in `catch_unwind` so a failed map drops one batch rather
@@ -304,15 +407,25 @@ impl GpuAnalog {
         offsets_hz: &[f64],
         decimation_factor: usize,
         cutoff_hz: f32,
-    ) -> Vec<Vec<Complex<f32>>> {
+    ) -> Result<Vec<Vec<Complex<f32>>>, GpuSweepError> {
         let n = iq_data.len();
         let n_probes = offsets_hz.len();
         if n == 0 || n_probes == 0 {
-            return vec![Vec::new(); n_probes];
+            return Ok(vec![Vec::new(); n_probes]);
         }
 
-        let decimation_factor = decimation_factor.max(1) as u32;
-        let out_len = n.div_ceil(decimation_factor as usize) as u32;
+        let limits = self.device.limits();
+        let dims = sweep_dims(
+            n,
+            n_probes,
+            decimation_factor,
+            limits
+                .max_buffer_size
+                .min(limits.max_storage_buffer_binding_size),
+            limits.max_compute_workgroups_per_dimension,
+        )?;
+        let decimation_factor = dims.decimation_factor;
+        let out_len = dims.out_len;
         let num_taps = DEFAULT_FIR_TAPS.min(SHADER_MAX_TAPS) as u32;
 
         let taps = design_fir_taps(cutoff_hz, sample_rate, DEFAULT_FIR_TAPS);
@@ -334,17 +447,14 @@ impl GpuAnalog {
 
         // Same split as the dispatch below; the shader needs the x-extent
         // in threads to rebuild its linear index.
-        let total_threads = n_probes as u32 * out_len;
-        let groups_x = total_threads
-            .div_ceil(WORKGROUP_SIZE)
-            .clamp(1, MAX_WORKGROUPS_PER_DIM);
+        let groups_x = dims.groups_x;
         let decimate_config = DecimateConfig {
             sample_rate: sample_rate as f32,
             decimation_factor,
             num_taps,
-            total_iq_len: n as u32,
+            total_iq_len: dims.total_iq_len,
             out_len,
-            n_probes: n_probes as u32,
+            n_probes: dims.n_probes,
             dispatch_width: groups_x * WORKGROUP_SIZE,
             _pad: 0,
         };
@@ -415,7 +525,7 @@ impl GpuAnalog {
             bytemuck::cast_slice(&[decimate_config]),
         );
 
-        let output_size = (n_probes as u64) * (out_len as u64) * 8;
+        let output_size = dims.output_size;
         let output_buf = ensure_buffer(
             &self.device,
             &mut pool.output,
@@ -482,10 +592,11 @@ impl GpuAnalog {
             // batch at 61.44 MSPS across a dozen probes asked for 120,150
             // groups and the dispatch failed validation, panicking the
             // worker. Spill the excess into y and re-flatten in the shader.
-            let groups = total_threads.div_ceil(WORKGROUP_SIZE);
-            let groups_x = groups.min(MAX_WORKGROUPS_PER_DIM);
-            let groups_y = groups.div_ceil(groups_x.max(1));
-            cpass.dispatch_workgroups(groups_x, groups_y, 1);
+            debug_assert!(
+                u64::from(dims.groups_x) * u64::from(dims.groups_y) * u64::from(WORKGROUP_SIZE)
+                    >= u64::from(dims.total_threads)
+            );
+            cpass.dispatch_workgroups(dims.groups_x, dims.groups_y, 1);
         }
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
 
@@ -519,7 +630,7 @@ impl GpuAnalog {
         drop(data);
         staging_buf.unmap();
 
-        results
+        Ok(results)
     }
 }
 
@@ -530,5 +641,56 @@ impl Drop for GpuAnalog {
         if let Some(handle) = self.poll_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIMIT: u64 = 1 << 31;
+
+    #[test]
+    fn an_ordinary_sweep_is_sized_as_before() {
+        // The case the dispatch split was written for: a 500k-sample
+        // batch across a dozen probes needs more groups than one
+        // dimension holds.
+        let dims = sweep_dims(8_000_000, 12, 16, LIMIT, 65_535).unwrap();
+        assert_eq!(dims.total_iq_len, 8_000_000);
+        assert_eq!(dims.out_len, 500_000);
+        assert_eq!(dims.total_threads, 6_000_000);
+        assert_eq!(dims.output_size, 48_000_000);
+        assert_eq!((dims.groups_x, dims.groups_y), (65_535, 2));
+        assert!(u64::from(dims.groups_x) * u64::from(dims.groups_y) * 64 >= 6_000_000);
+
+        // A zero factor means "no decimation", as on the CPU path.
+        let dims = sweep_dims(65_536, 9, 0, LIMIT, 65_535).unwrap();
+        assert_eq!((dims.decimation_factor, dims.out_len), (1, 65_536));
+        assert_eq!((dims.groups_x, dims.groups_y), (9_216, 1));
+    }
+
+    #[test]
+    fn sizes_past_32_bits_are_refused() {
+        // 857 probes x 6M output samples is 5.1e9 invocations, which as
+        // a u32 product is ~8.5e8.
+        assert!(sweep_dims(6_000_000, 857, 1, u64::MAX, 65_535).is_err());
+        // An input the shader's i32 index cannot reach.
+        assert!(sweep_dims(i32::MAX as usize + 1, 1, 1, u64::MAX, 65_535).is_err());
+        if usize::BITS > 32 {
+            assert!(sweep_dims(1 << 33, 1, 1 << 20, u64::MAX, 65_535).is_err());
+            assert!(sweep_dims(65_536, 1 << 33, 1, u64::MAX, 65_535).is_err());
+            assert!(sweep_dims(65_536, 4, 1 << 33, u64::MAX, 65_535).is_err());
+        }
+    }
+
+    #[test]
+    fn sizes_past_the_device_limits_are_refused() {
+        // 64 MiB of input rounds to a 64 MiB buffer: over a 32 MiB limit.
+        assert!(sweep_dims(8 << 20, 1, 1 << 10, 32 << 20, 65_535).is_err());
+        // The output buffer is the one that is too big.
+        assert!(sweep_dims(1 << 20, 64, 1, 256 << 20, 65_535).is_err());
+        // More workgroups than a small device takes in two dimensions.
+        assert!(sweep_dims(1 << 20, 64, 1, LIMIT, 256).is_err());
+        assert!(sweep_dims(1 << 20, 4, 1, LIMIT, 256).is_ok());
     }
 }

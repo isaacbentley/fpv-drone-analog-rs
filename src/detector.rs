@@ -607,6 +607,11 @@ impl AnalogFpvDetector {
         if n < 2048 || sample_rate == 0 {
             return (SignalType::Unknown, 0.0);
         }
+        // This is a public entry point in its own right, so it cannot
+        // rely on `detect_from_iq` having cleaned the block: a NaN or an
+        // overflowing sample here would reach the integrator's averages.
+        let sanitized = crate::types::sanitize_iq(iq_data);
+        let iq_data: &[Complex<f32>] = &sanitized;
 
         // FM demodulation: instantaneous frequency via arg(z[n] * conj(z[n-1])).
         // Use the single shared implementation in `demod::fm_demod_into` so
@@ -623,7 +628,10 @@ impl AnalogFpvDetector {
             var += diff * diff;
         }
         var /= demod_len as f32;
-        if var < 1e-6 {
+        // A NaN variance must take this return too (`NaN < x` is false):
+        // past it the spectrum is NaN and would be folded into the
+        // integrator.
+        if var.is_nan() || var < 1e-6 {
             return (SignalType::Unknown, 0.0);
         }
 
@@ -1019,9 +1027,7 @@ impl AnalogFpvDetector {
         // elements on a wideband sweep. The peak was already extracted
         // above, so we can reorder the buffer in place.
         let mid = cepstrum_mag.len() / 2;
-        cepstrum_mag.select_nth_unstable_by(mid, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        cepstrum_mag.select_nth_unstable_by(mid, f32::total_cmp);
         let median = cepstrum_mag[mid];
 
         // ---- Step 6: threshold check ----
@@ -1236,11 +1242,15 @@ impl SpectralIntegrator {
         {
             self.buckets.remove(&lru);
         }
+        // A running average never recovers from a NaN or an infinity, so
+        // neither may be stored: a non-finite bin starts at zero and is
+        // skipped on update, leaving that bin's average as it was.
+        let finite_or_zero = |x: &f32| if x.is_finite() { *x } else { 0.0 };
         let bucket = match self.buckets.entry(key) {
             Entry::Vacant(slot) => {
                 return &slot
                     .insert(SpectralBucket {
-                        mags: fresh.to_vec(),
+                        mags: fresh.iter().map(finite_or_zero).collect(),
                         count: 1,
                         last_used: now,
                     })
@@ -1251,13 +1261,15 @@ impl SpectralIntegrator {
         bucket.last_used = now;
         if bucket.mags.len() != fresh.len() {
             bucket.mags.clear();
-            bucket.mags.extend_from_slice(fresh);
+            bucket.mags.extend(fresh.iter().map(finite_or_zero));
             bucket.count = 1;
         } else {
             bucket.count = (bucket.count + 1).min(self.window);
             let alpha = 1.0 / bucket.count as f32;
             for (avg, &x) in bucket.mags.iter_mut().zip(fresh) {
-                *avg += alpha * (x - *avg);
+                if x.is_finite() {
+                    *avg += alpha * (x - *avg);
+                }
             }
         }
         &bucket.mags
@@ -1444,30 +1456,17 @@ impl AnalogFpvDetector {
             return vec![];
         }
 
-        let nan_count = iq_data
-            .iter()
-            .filter(|s| !s.re.is_finite() || !s.im.is_finite())
-            .count();
-        let sanitized_iq;
-        let iq_data = if nan_count > 0 {
+        // Non-finite samples become zero and finite ones are held to
+        // ±`MAX_IQ_COMPONENT`: a sample that is finite but enormous
+        // overflows in the discriminator and turns into NaN there.
+        let sanitized_iq = crate::types::sanitize_iq(iq_data);
+        if matches!(sanitized_iq, std::borrow::Cow::Owned(_)) {
             log::warn!(
-                "Sanitized {} non-finite samples (NaN/Inf) to zero in Analog processing",
-                nan_count
+                "Sanitized non-finite or out-of-range samples (NaN/Inf/|x| > {:e}) in Analog processing",
+                crate::types::MAX_IQ_COMPONENT
             );
-            sanitized_iq = iq_data
-                .iter()
-                .map(|s| {
-                    if s.re.is_finite() && s.im.is_finite() {
-                        *s
-                    } else {
-                        Complex::new(0.0, 0.0)
-                    }
-                })
-                .collect::<Vec<_>>();
-            &sanitized_iq[..]
-        } else {
-            iq_data
-        };
+        }
+        let iq_data: &[Complex<f32>] = &sanitized_iq;
 
         let mut final_results = Vec::new();
 
@@ -1639,10 +1638,14 @@ impl AnalogFpvDetector {
             let mut probes: Vec<(f64, f32, Vec<Complex<f32>>, u32)> = Vec::with_capacity(n_steps);
 
             #[cfg(feature = "gpu")]
-            let gpu_decimated: Option<Vec<Vec<Complex<f32>>>> = self.gpu.as_ref().map(|gpu| {
+            let gpu_decimated: Option<Vec<Vec<Complex<f32>>>> = self.gpu.as_ref().and_then(|gpu| {
                 let decimation_factor = Self::decimation_factor(sample_rate, target_rate_prime);
                 let cutoff_hz = target_rate_prime as f32 / 3.0;
+                // A batch the GPU cannot size safely runs on the CPU
+                // path below instead.
                 gpu.sweep(iq_data, sample_rate, &offsets, decimation_factor, cutoff_hz)
+                    .map_err(|e| log::warn!("GPU sweep declined ({e}); using the CPU sweep"))
+                    .ok()
             });
             #[cfg(not(feature = "gpu"))]
             let gpu_decimated: Option<Vec<Vec<Complex<f32>>>> = None;
@@ -1681,7 +1684,7 @@ impl AnalogFpvDetector {
             // `n_steps >= 4` is guaranteed by the narrow-capture return
             // above, so the percentile is always meaningful here.
             let mut sorted_e: Vec<f32> = probes.iter().map(|p| p.1).collect();
-            sorted_e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_e.sort_by(f32::total_cmp);
             let noise_floor = sorted_e[sorted_e.len() / 4];
             let max_energy = sorted_e.last().copied().unwrap_or(0.0);
             let multiplier = 10.0f32.powf(self.energy_threshold_db / 10.0);
@@ -1781,7 +1784,7 @@ impl AnalogFpvDetector {
             // step off-centre resolves it cleanly. Letting energy pick the
             // classification too meant a strong signal was reported as
             // nothing at all.
-            sweep_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sweep_hits.sort_by(|a, b| b.1.total_cmp(&a.1));
             // Total window width. The membership test below uses half of
             // it as a radius around the anchor. A bare `abs() < 25 MHz`
             // would be one-sided only while hits are sorted by frequency;
@@ -1879,11 +1882,7 @@ impl AnalogFpvDetector {
         }
         // Final dedup: merge results within DEDUP_RADIUS_HZ (2 MHz) of a
         // group's anchor, keeping the strongest
-        final_results.sort_by(|a, b| {
-            (a.frequency_hz as f64)
-                .partial_cmp(&(b.frequency_hz as f64))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        final_results.sort_by(|a, b| (a.frequency_hz as f64).total_cmp(&(b.frequency_hz as f64)));
         let mut deduped = dedup_by_frequency(final_results);
 
         deduped.retain(|r| {
@@ -2084,7 +2083,9 @@ mod tests {
         // Two consecutive sweeps: the second reuses the persistent
         // buffer pool, so this also guards the pooled-upload path.
         for label in ["fresh-buffers", "pooled-rerun"] {
-            let gpu_out = gpu.sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz);
+            let gpu_out = gpu
+                .sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz)
+                .unwrap();
             let gpu_probe = &gpu_out[0];
 
             assert_eq!(
@@ -2128,7 +2129,9 @@ mod tests {
 
         let mut ddc = crate::ddc::StreamingDDC::new(offset_hz as f32, sample_rate, cutoff_hz);
         let cpu_out = ddc.process_decimated(&iq, decimation_factor);
-        let gpu_out = gpu.sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz);
+        let gpu_out = gpu
+            .sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz)
+            .unwrap();
         let gpu_probe = &gpu_out[0];
         assert_eq!(cpu_out.len(), gpu_probe.len());
         let mut sq_err = 0.0f64;
@@ -2762,6 +2765,57 @@ mod integration_tests {
             last.0,
             last.1
         );
+    }
+
+    /// A running average cannot shed a NaN, so one must never be stored:
+    /// that 1 MHz key would be blind until the bucket was evicted.
+    #[test]
+    fn integrator_never_stores_a_non_finite_bin() {
+        let mut integ = SpectralIntegrator::new(4);
+        let mut bad = vec![2.0f32; 8];
+        bad[1] = f32::NAN;
+        bad[2] = f32::INFINITY;
+        // As the first spectrum of a bucket, on an update, and on a
+        // length-change restart.
+        let first = integ.accumulate(5_800_000_000, &bad).to_vec();
+        assert!(first.iter().all(|v| v.is_finite()), "{first:?}");
+        integ.accumulate(5_800_000_000, &[4.0f32; 8]);
+        let avg = integ.accumulate(5_800_000_000, &bad).to_vec();
+        assert!(avg.iter().all(|v| v.is_finite()), "{avg:?}");
+        // The good bins still averaged; the bad ones kept their value.
+        assert!((avg[0] - (2.0 + 4.0 + 2.0) / 3.0).abs() < 1e-6);
+        assert!((avg[1] - 2.0).abs() < 1e-6, "{}", avg[1]);
+        let mut bad_short = vec![1.0f32; 4];
+        bad_short[3] = f32::NEG_INFINITY;
+        let restarted = integ.accumulate(5_800_000_000, &bad_short).to_vec();
+        assert_eq!(restarted, vec![1.0, 1.0, 1.0, 0.0]);
+    }
+
+    /// Finite samples large enough to overflow the discriminator's
+    /// product are not caught by a non-finite check; they come out of
+    /// the FM demodulator as NaN, which must not reach the integrator.
+    #[test]
+    fn hostile_samples_leave_no_nan_in_the_integrator() {
+        let det = AnalogFpvDetector::default();
+        let mut integ = SpectralIntegrator::new(4);
+        let mut iq: Vec<Complex<f32>> = (0..8192)
+            .map(|i| Complex::from_polar(1.0, 0.4 * (i as f32 * 0.01).sin() * i as f32))
+            .collect();
+        iq[500] = Complex::new(1.0e30, 1.0e30);
+        iq[501] = Complex::new(1.0e30, -1.0e30);
+        iq[900] = Complex::new(f32::NAN, 1.0);
+        iq[901] = Complex::new(3.0e38, f32::INFINITY);
+        for _ in 0..3 {
+            det.detect_sync_pulses_integrated(&iq, 8_000_000, 5_800_000_000, &mut integ);
+            det.detect_from_iq_integrated(&iq, 5_800_000_000, 8_000_000, &mut integ);
+            det.detect_from_iq_integrated(&iq, 5_800_000_000, 40_000_000, &mut integ);
+        }
+        for (key, bucket) in &integ.buckets {
+            assert!(
+                bucket.mags.iter().all(|v| v.is_finite()),
+                "bucket {key} holds a non-finite magnitude"
+            );
+        }
     }
 
     #[test]

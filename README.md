@@ -1,8 +1,8 @@
 # orecchiette-fpv-drone-analog-rs
 
-[![CI](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml)
-[![Codecov](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs)
-[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
+[![CI](https://github.com/isaacbentley/fpv-drone-analog-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/fpv-drone-analog-rs/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/isaacbentley/fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/fpv-drone-analog-rs)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
 A Rust crate for detecting and decoding analog FPV drone video from raw
 I/Q samples. It covers FM demodulation, sync detection, and frame

@@ -194,6 +194,13 @@ const BROAD_SPACING_TOLERANCE: f32 = 0.15;
 /// or the active-video datum, so a wider net is fine.
 const EQ_RUN_TOLERANCE: f32 = 0.25;
 
+/// Longest equalizing-pulse run [`count_adjacent_run`] will count. A
+/// real vertical interval has 5 or 6 either side of the broad pulses and
+/// the only consumer saturates at 10, so this changes no result; it stops
+/// a crafted half-line pulse train from being walked end to end for
+/// every broad group.
+const MAX_EQ_RUN: usize = 32;
+
 /// How far (in nominal line periods) to search for horizontal-sync
 /// pulses to fit a local line-period/phase grid against.
 const H_GRID_SEARCH_LINES: f32 = 20.0;
@@ -292,7 +299,7 @@ fn fit_h_grid(pulses: &[SyncPulse], nominal_period: f32, near: f32) -> Option<f3
     if candidates.len() < 4 {
         return None;
     }
-    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(f32::total_cmp);
 
     let mut intervals: Vec<f32> = candidates.windows(2).map(|w| w[1] - w[0]).collect();
     intervals.retain(|&d| (d - nominal_period).abs() < nominal_period * 0.1);
@@ -319,27 +326,36 @@ fn count_adjacent_run(
     direction: f32,
     kind: PulseKind,
 ) -> usize {
+    let tolerance = half_period * EQ_RUN_TOLERANCE;
     let mut count = 0usize;
     let mut expected = anchor_start;
-    loop {
+    while count < MAX_EQ_RUN {
+        let previous = expected;
         expected += direction * half_period;
+        // `pulses` is in ascending `start` order (`extract_pulses` emits
+        // it that way), so the pulses inside the tolerance window are one
+        // contiguous range, found by bisection instead of a full scan.
+        let lo = pulses.partition_point(|p| p.start as f32 <= expected - tolerance);
+        let hi = pulses.partition_point(|p| (p.start as f32) < expected + tolerance);
         let found = pulses
+            .get(lo..hi)
+            .unwrap_or_default()
             .iter()
-            .filter(|p| {
-                p.kind == kind && (p.start as f32 - expected).abs() < half_period * EQ_RUN_TOLERANCE
-            })
+            .filter(|p| p.kind == kind)
             .min_by(|a, b| {
                 (a.start as f32 - expected)
                     .abs()
-                    .partial_cmp(&(b.start as f32 - expected).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&(b.start as f32 - expected).abs())
             });
         match found {
-            Some(p) => {
+            // The walk must move: at sample offsets where an `f32` can no
+            // longer represent a half-line step, the same pulse would be
+            // found again at distance zero, without end.
+            Some(p) if (p.start as f32 - previous) * direction > 0.0 => {
                 count += 1;
                 expected = p.start as f32;
             }
-            None => break,
+            _ => break,
         }
     }
     count
@@ -623,9 +639,7 @@ pub fn find_vertical_sync_near(
                 };
                 broad_score * 1.5 + eq_score * 0.5 + parity_bonus - dist_penalty
             };
-            score(a)
-                .partial_cmp(&score(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            score(a).total_cmp(&score(b))
         })
 }
 
@@ -667,6 +681,83 @@ pub fn find_vertical_sync(
 mod tests {
     use super::*;
     use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_fields};
+
+    fn eq_pulse(start: usize) -> SyncPulse {
+        SyncPulse {
+            start,
+            end: start + 30,
+            center: start as f32 + 15.0,
+            width_us: 2.3,
+            kind: PulseKind::Equalizing,
+        }
+    }
+
+    /// The run a real vertical interval produces is counted exactly, in
+    /// both directions, picking the nearest pulse inside the tolerance
+    /// and ignoring other kinds.
+    #[test]
+    fn an_equalizing_run_is_counted_as_before() {
+        let half = 500.0f32;
+        // Anchor at 10_000; six equalizing pulses after it (with a few
+        // samples of jitter), then a gap.
+        let mut pulses: Vec<SyncPulse> = [10_503, 10_998, 11_500, 12_004, 12_499, 13_001]
+            .into_iter()
+            .map(eq_pulse)
+            .collect();
+        // Five before it.
+        pulses.extend(
+            [9_498, 9_001, 8_500, 7_996, 7_502]
+                .into_iter()
+                .map(eq_pulse),
+        );
+        // A horizontal pulse on the grid must not extend the run, and a
+        // pulse outside the 25% tolerance must not either.
+        pulses.push(SyncPulse {
+            kind: PulseKind::Horizontal,
+            ..eq_pulse(13_500)
+        });
+        pulses.push(eq_pulse(7_150));
+        pulses.sort_by_key(|p| p.start);
+        assert_eq!(
+            count_adjacent_run(&pulses, 10_000.0, half, 1.0, PulseKind::Equalizing),
+            6
+        );
+        assert_eq!(
+            count_adjacent_run(&pulses, 10_000.0, half, -1.0, PulseKind::Equalizing),
+            5
+        );
+        assert_eq!(
+            count_adjacent_run(&pulses, 10_000.0, half, 1.0, PulseKind::Broad),
+            0
+        );
+        assert_eq!(count_adjacent_run(&[], 0.0, half, 1.0, PulseKind::Broad), 0);
+    }
+
+    /// A crafted half-line pulse train of any length is walked for at
+    /// most `MAX_EQ_RUN` steps, not end to end.
+    #[test]
+    fn an_endless_pulse_train_is_capped() {
+        let pulses: Vec<SyncPulse> = (1..=100_000).map(|k| eq_pulse(k * 500)).collect();
+        assert_eq!(
+            count_adjacent_run(&pulses, 0.0, 500.0, 1.0, PulseKind::Equalizing),
+            MAX_EQ_RUN
+        );
+    }
+
+    /// Where an `f32` can no longer represent a half-line step, the same
+    /// pulse is found again at distance zero; the walk has to stop.
+    #[test]
+    fn a_walk_that_cannot_advance_stops() {
+        let far = 1usize << 30;
+        let pulses = vec![eq_pulse(far), eq_pulse(far + 8)];
+        // `far as f32 + 8.0 == far as f32`.
+        let n = count_adjacent_run(&pulses, far as f32, 8.0, 1.0, PulseKind::Equalizing);
+        assert_eq!(n, 0);
+        // Degenerate spacing must terminate too.
+        for half in [0.0, f32::NAN, -500.0, f32::INFINITY] {
+            let _ = count_adjacent_run(&pulses, 0.0, half, 1.0, PulseKind::Equalizing);
+        }
+    }
 
     fn synth_config(is_pal: bool, start_field: FieldParity) -> SyntheticVideoConfig {
         SyntheticVideoConfig {

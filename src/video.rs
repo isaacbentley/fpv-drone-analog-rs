@@ -1633,9 +1633,7 @@ impl FrameReconstructor {
                     .map(|&(x, y)| (y - (intercept + slope * x)).abs())
                     .collect();
                 let mid = resid.len() / 2;
-                resid.select_nth_unstable_by(mid, |a, b| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                resid.select_nth_unstable_by(mid, f64::total_cmp);
                 // 1.4826·MAD ≈ σ for Gaussian residuals; floor at 1
                 // sample so an already-clean field can't reject its own
                 // near-perfect tips.
@@ -1717,8 +1715,7 @@ impl FrameReconstructor {
 
                     // Use the median of the history buffer as the stabilised line period
                     let mut sorted_history = self.period_history.clone();
-                    sorted_history
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    sorted_history.sort_by(f32::total_cmp);
                     let stabilised_period = sorted_history[sorted_history.len() / 2];
 
                     self.line_period = if self.use_line_locked_clock {
@@ -1758,10 +1755,10 @@ impl FrameReconstructor {
         // Compute MAD of intervals
         let reject_threshold = if measured_intervals.len() >= 5 {
             let mut iv_vals: Vec<f32> = measured_intervals.iter().map(|(_, v)| *v).collect();
-            iv_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            iv_vals.sort_by(f32::total_cmp);
             let iv_median = iv_vals[iv_vals.len() / 2];
             let mut abs_devs: Vec<f32> = iv_vals.iter().map(|v| (v - iv_median).abs()).collect();
-            abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            abs_devs.sort_by(f32::total_cmp);
             let mad = abs_devs[abs_devs.len() / 2];
             // 3×MAD, but at least 3 samples (noise floor)
             (3.0 * mad).max(3.0)
@@ -1806,7 +1803,7 @@ impl FrameReconstructor {
             // field's trailing phase so we still produce a grid.
             self.sync_phase
         } else {
-            intercepts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            intercepts.sort_by(f32::total_cmp);
             intercepts[intercepts.len() / 2]
         };
         if is_coasting_vbi && qualified_h_grid {
@@ -1916,7 +1913,7 @@ impl FrameReconstructor {
             let ts_slope = if slopes.is_empty() {
                 self.line_period
             } else {
-                slopes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                slopes.sort_by(f32::total_cmp);
                 slopes[slopes.len() / 2]
             };
             let slope_drift = (ts_slope - self.line_period) * n_rows as f32;
@@ -2586,7 +2583,10 @@ impl FrameReconstructor {
             uncertainty_seconds,
         };
         ReconstructInternalResult::Success {
-            consumed: consumed.min(demod_data.len()),
+            // Never zero: a caller draining fields in a loop would be
+            // handed the same field from the same samples without end.
+            // (`demod_data` is non-empty here, so 1 is within it.)
+            consumed: consumed.min(demod_data.len()).max(1),
             timing,
         }
     }

@@ -150,6 +150,13 @@ impl Deemphasis {
     /// previous call (or from [`Self::reset`]/construction).
     pub fn process_in_place(&mut self, data: &mut [f32]) {
         for x in data.iter_mut() {
+            // A NaN or infinite input would lodge in `y` for good: every
+            // later output is `alpha·x + (1 − alpha)·y`. Hold the last
+            // good output across it instead (zero before there is one).
+            if !x.is_finite() {
+                *x = if self.primed { self.y } else { 0.0 };
+                continue;
+            }
             if !self.primed {
                 // Seed the state with the first sample rather than 0.0
                 // so a call starting on a non-zero DC level doesn't
@@ -264,6 +271,10 @@ impl PllFmDemod {
             // Phase detector: full atan2 (not a small-angle shortcut) so
             // large transient errors still steer the loop the right way.
             let e = (z * self.nco.conj()).arg();
+            // A non-finite sample gives a NaN error, which would lodge in
+            // the integrator (`freq`) and the NCO permanently. Coast on
+            // the current frequency estimate for that sample instead.
+            let e = if e.is_finite() { e } else { 0.0 };
             self.freq = (self.freq + self.ki * e).clamp(-self.freq_max, self.freq_max);
             let inst = self.freq + self.kp * e;
             out.push(inst);
@@ -298,6 +309,65 @@ impl PllFmDemod {
 mod tests {
     use super::*;
     use std::f32::consts::PI;
+
+    /// A NaN must not lodge in the filter state, where it would make
+    /// every later output NaN until the next reset.
+    #[test]
+    fn deemphasis_recovers_from_non_finite_input() {
+        let mut clean = Deemphasis::new(15_360_000, 0.75e-6);
+        let mut data = vec![0.25f32; 64];
+        clean.process_in_place(&mut data);
+        let settled = data[63];
+
+        let mut d = Deemphasis::new(15_360_000, 0.75e-6);
+        let mut data = vec![0.25f32; 64];
+        data[10] = f32::NAN;
+        data[11] = f32::INFINITY;
+        data[12] = f32::NEG_INFINITY;
+        d.process_in_place(&mut data);
+        assert!(data.iter().all(|v| v.is_finite()), "{data:?}");
+        assert!((data[63] - settled).abs() < 1e-3);
+
+        // Non-finite before the first good sample: nothing to hold yet.
+        let mut d = Deemphasis::new(15_360_000, 0.75e-6);
+        let mut data = [f32::NAN, 0.5, 0.5];
+        d.process_in_place(&mut data);
+        assert_eq!(data, [0.0, 0.5, 0.5]);
+    }
+
+    /// Finite input is filtered exactly as the recurrence says.
+    #[test]
+    fn deemphasis_is_unchanged_for_finite_input() {
+        let (fs, tau) = (15_360_000u32, 0.75e-6f32);
+        let alpha = 1.0 - (-1.0 / (fs as f32 * tau)).exp();
+        let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
+        let mut out = input.clone();
+        Deemphasis::new(fs, tau).process_in_place(&mut out);
+        let mut y = input[0];
+        for (i, &x) in input.iter().enumerate() {
+            if i > 0 {
+                y = alpha * x + (1.0 - alpha) * y;
+            }
+            assert_eq!(out[i], y, "sample {i}");
+        }
+    }
+
+    /// A NaN sample must not leave the loop's integrator and NCO NaN.
+    #[test]
+    fn pll_recovers_from_non_finite_input() {
+        let mut pll = PllFmDemod::new(30_720_000, 1.0e6, 6.0e6);
+        let mut iq: Vec<Complex<f32>> = (0..4096)
+            .map(|i| Complex::from_polar(1.0, 0.05 * i as f32))
+            .collect();
+        iq[1000] = Complex::new(f32::NAN, f32::NAN);
+        iq[1001] = Complex::new(f32::INFINITY, 0.0);
+        let mut out = Vec::new();
+        pll.process_into(&iq, &mut out);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(pll.phase_error_rms().is_finite());
+        // Back on the tone's 0.05 rad/sample by the end.
+        assert!((out[4095] - 0.05).abs() < 0.01, "{}", out[4095]);
+    }
 
     /// Regression guard: the demodulator must produce the same phase differences as a
     /// straightforward scalar reference, ensuring correctness near ±π.

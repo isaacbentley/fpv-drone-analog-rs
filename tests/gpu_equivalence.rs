@@ -198,7 +198,9 @@ fn large_sweep_exceeds_one_dispatch_dimension() {
         "test must actually exceed one dimension; got {groups_1d} groups"
     );
 
-    let out = gpu.sweep(&iq, sample_rate, &offsets, decimation_factor, 2.0e6);
+    let out = gpu
+        .sweep(&iq, sample_rate, &offsets, decimation_factor, 2.0e6)
+        .expect("a sweep inside the device limits");
     assert_eq!(out.len(), offsets.len(), "one baseband per probe");
     for (i, probe) in out.iter().enumerate() {
         assert_eq!(probe.len(), out_len, "probe {i} truncated");
