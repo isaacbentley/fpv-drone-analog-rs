@@ -581,7 +581,7 @@ this is classic noncoherent (post-detection) integration.
   sweeps and rescans) and gives single-channel standard detection up to 4
   chunks of patience before settling for an ambiguous answer.
 
-## 12. Phase-1 TBC/Dropout & Optional Neural Restoration
+## 12. Phase-1 TBC/Dropout
 
 Weak-signal recovery techniques, measured against the baseline with
 `examples/weak_signal_sweep.rs` (the gate: a technique ships only if it
@@ -610,77 +610,6 @@ flags, **on by default**, each disableable via a `with_*` builder:
 frame-fidelity scoring) and `impairments` (multipath, burst dropout,
 slow fade, impulsive noise) drive `examples/weak_signal_sweep.rs`, which
 reports a σ-cliff per demod across every impairment profile.
-
-**Optional neural restoration** (`neural-vsr` feature — deliberately
-**not** in default cargo features, so ONNX Runtime is never forced on
-consumers): `neural::NeuralRestorer` runs a small temporal denoiser
-(`models/temporal_denoiser.onnx`, ~19 KB FP32) over the
-reconstructed luma field via `ort`, with a CoreML execution provider on
-macOS (Apple Neural Engine / GPU; other targets use `ort`'s CPU
-provider) and a carried hidden state for temporal context.
-`models/train_temporal.py` generates the synthetic RF training data.
-
-The model takes three inputs — `input` (luma), `noise` (a spatially
-constant **CNR-conditioning plane**), and `hidden_in`. The conditioning
-plane is what lets one model serve every link quality: it modulates
-denoising strength per frame instead of applying worst-case smoothing.
-Both sides of that contract must agree on the normalisation —
-`CNR_FULL_SCALE_DB = 30` in the trainer, and
-`FrameReconstructor::set_neural_noise_level` (`cnr_db / 30`, clamped) at
-inference, fed from `levels::estimate_cnr_db`. `NeuralRestorer` reads
-the hidden-state width and input signature from the model at load, so
-it also runs pre-conditioning 2-input models unchanged.
-
-It is wired as an explicit `with_neural_restorer(model_path, use_gpu)`
-builder rather than a `::new` default — the constructor never does disk
-I/O, and the caller supplies the model path (a library must not assume a
-CWD-relative location).
-
-### Measured A/B (frame GCOR, `weak_signal_sweep`)
-
-Discriminator field, denoiser off vs on, conditioning plane fed from
-`levels::estimate_cnr_db`:
-
-| profile | σ | off | on | Δ |
-| :-- | --: | --: | --: | --: |
-| BurstDropout | 0.00 | 0.35 | **0.86** | **+0.51** |
-| AWGN | 0.30 | 0.03 | **0.25** | **+0.23** |
-| ImpulsiveNoise | 0.30 | 0.03 | **0.25** | **+0.22** |
-| Multipath | 0.30 | 0.02 | **0.15** | **+0.12** |
-| AWGN / Impulsive | 0.00 | 1.00 | 0.96 | −0.04 |
-| SlowFade | 0.00 | 1.00 | 0.83 | **−0.17** |
-
-The pattern: **large gains on structured damage** (burst dropout is what
-a temporal model with a hidden state is *for* — it repairs localised
-loss from previous fields), useful gains in the marginal band around
-σ = 0.3–0.5, and a small cost on a genuinely clean signal. Beyond
-σ ≈ 0.7 nothing helps — the field is gone before the denoiser sees it.
-That profile is why the denoiser is opt-in rather than default: it earns
-its place when the link is impaired, not when it is clean.
-
-**Known weak spot — SlowFade at σ=0 (−0.17).** A slow fade leaves the
-picture intact while the *envelope* CNR estimate reads low (~3.5 dB), so
-the conditioning plane tells the model to denoise hard on a field that
-didn't need it. That is a limitation of the envelope CNR estimator under
-amplitude fading, not of the model; a fade-aware quality metric would
-fix it.
-
-### Training (`models/train_temporal.py`)
-
-Sequences carry sub-pixel motion so temporal fusion can't degenerate
-into frame averaging (a denoiser trained on static repeats learns to
-average, which is ghosting on real motion); the loss is
-`L1 + λ·gradient-L1` so edge structure is optimised directly — the same
-quantity `metrics::compute_gradient_correlation` grades; ~20 % of
-sequences are clean passthrough so identity is learned rather than
-denoising a clean field; and the synthetic RF channel randomises
-multipath, burst dropout, in-frame fade, impulsive spikes and in-band
-interferers (CW, swept chirp, OFDM-like) to mirror `impairments.rs`.
-`--places-only` trains on Places365 (native 256 px → real 128 px crops)
-rather than upscaled STL10 thumbnails. INT8 dynamic quantization
-measurably degraded fidelity (−0.05 GCOR) and produced a *larger* file
-than FP32 at this model size, so the shipped model is FP32
-(`--no-quantize`).
 
 ### Still open
 

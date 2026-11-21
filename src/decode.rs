@@ -210,8 +210,6 @@ pub struct StreamingFpvDecoder {
     min_samples_per_field: usize,
     profiling: bool,
     timings: DecodeStageTimings,
-    #[cfg(feature = "neural-vsr")]
-    stashed_restorer: Option<crate::neural::NeuralRestorer>,
 }
 
 impl StreamingFpvDecoder {
@@ -274,8 +272,6 @@ impl StreamingFpvDecoder {
             min_samples_per_field,
             profiling: false,
             timings: DecodeStageTimings::default(),
-            #[cfg(feature = "neural-vsr")]
-            stashed_restorer: None,
         })
     }
 
@@ -361,12 +357,6 @@ impl StreamingFpvDecoder {
         if let Some(t) = start {
             self.timings.deemphasis += t.elapsed();
         }
-        #[cfg(feature = "neural-vsr")]
-        if self.reconstructor.neural_restorer.is_some()
-            && let Some(cnr) = self.cnr_db()
-        {
-            self.reconstructor.set_neural_noise_level(cnr);
-        }
         let start = self.profiling.then(Instant::now);
         if self.demod_start > self.compact_after {
             self.demod_buffer.drain(..self.demod_start);
@@ -433,26 +423,6 @@ impl StreamingFpvDecoder {
             self.reconstructor.forget_history();
         }
         skipped
-    }
-
-    #[cfg(feature = "neural-vsr")]
-    pub fn load_neural_restorer(&mut self, path: &str, use_gpu: bool) -> ort::Result<()> {
-        let restorer = crate::neural::NeuralRestorer::new(path, use_gpu)?;
-        self.reconstructor.neural_restorer = Some(restorer);
-        self.stashed_restorer = None;
-        self.reconstructor.hidden_state = None;
-        Ok(())
-    }
-
-    #[cfg(feature = "neural-vsr")]
-    pub fn set_restoration_enabled(&mut self, enabled: bool) {
-        if enabled && self.reconstructor.neural_restorer.is_none() {
-            self.reconstructor.neural_restorer = self.stashed_restorer.take();
-            self.reconstructor.hidden_state = None;
-        } else if !enabled && self.reconstructor.neural_restorer.is_some() {
-            self.stashed_restorer = self.reconstructor.neural_restorer.take();
-            self.reconstructor.hidden_state = None;
-        }
     }
 }
 

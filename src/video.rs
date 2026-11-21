@@ -435,24 +435,6 @@ pub struct FrameReconstructor {
     pub use_smart_doc: bool,
     pub smart_doc_spatial_weight: f32,
 
-    #[cfg(feature = "neural-vsr")]
-    pub neural_restorer: Option<crate::neural::NeuralRestorer>,
-    #[cfg(feature = "neural-vsr")]
-    pub hidden_state: Option<Vec<f32>>,
-    /// Persistent luma in/out scratch for the neural pass, so the hot
-    /// path doesn't allocate two full-frame `Vec`s per rendered frame.
-    #[cfg(feature = "neural-vsr")]
-    neural_in: Vec<f32>,
-    #[cfg(feature = "neural-vsr")]
-    neural_out: Vec<f32>,
-    /// Normalised link-quality conditioning in `[0, 1]` (1 = clean) fed
-    /// to the neural restorer's noise plane. Set per frame by the caller
-    /// via [`Self::set_neural_noise_level`]; defaults to 1.0 (assume
-    /// clean) so an un-wired caller gets light-touch denoising, not
-    /// worst-case smoothing.
-    #[cfg(feature = "neural-vsr")]
-    neural_noise_level: f32,
-
     /// Holds the complete RGB frame between calls so consecutive
     /// `reconstruct_frame_into` calls (each one capturing a single
     /// NTSC/PAL *field*) can be merged into a single interlaced
@@ -859,17 +841,6 @@ impl FrameReconstructor {
             use_smart_doc: true,
             smart_doc_spatial_weight: 0.5,
 
-            #[cfg(feature = "neural-vsr")]
-            neural_restorer: None,
-            #[cfg(feature = "neural-vsr")]
-            hidden_state: None,
-            #[cfg(feature = "neural-vsr")]
-            neural_in: vec![0.0; width * height],
-            #[cfg(feature = "neural-vsr")]
-            neural_out: vec![0.0; width * height],
-            #[cfg(feature = "neural-vsr")]
-            neural_noise_level: 1.0,
-
             sync_level_scratch: Vec::new(),
             field_buf: vec![0u32; width * height],
             field_parity: 0,
@@ -979,10 +950,6 @@ impl FrameReconstructor {
         // showing black bars.
         self.interlace_reacquiring = true;
         self.in_dropout = false;
-        #[cfg(feature = "neural-vsr")]
-        {
-            self.hidden_state = None;
-        }
     }
 
     /// Override the temporal history window size. Default is
@@ -1092,31 +1059,6 @@ impl FrameReconstructor {
     pub fn with_smart_doc(mut self, enable: bool, spatial_weight: f32) -> Self {
         self.use_smart_doc = enable;
         self.smart_doc_spatial_weight = spatial_weight.clamp(0.0, 1.0);
-        self
-    }
-
-    /// Set the neural restorer's per-frame link-quality conditioning
-    /// from a CNR estimate in dB (e.g. [`crate::levels::estimate_cnr_db`]
-    /// on the current IQ chunk). The reconstructor only sees demodulated
-    /// data, so the caller — which has the IQ — must push this in before
-    /// each `reconstruct_frame_into`. Normalised with the SAME map the
-    /// model trained against (`CNR_FULL_SCALE_DB = 30` in
-    /// `models/train_temporal.py`): `(cnr_db / 30).clamp(0, 1)`.
-    #[cfg(feature = "neural-vsr")]
-    pub fn set_neural_noise_level(&mut self, cnr_db: f32) {
-        self.neural_noise_level = (cnr_db / 30.0).clamp(0.0, 1.0);
-    }
-
-    /// Enable the optional temporal neural denoiser, loading the ONNX
-    /// model from `model_path`. The caller supplies the path — a library
-    /// must not assume a CWD-relative location. A load failure is logged
-    /// and leaves the restorer disabled (reconstruction still works).
-    #[cfg(feature = "neural-vsr")]
-    pub fn with_neural_restorer(mut self, model_path: &str, use_gpu: bool) -> Self {
-        match crate::neural::NeuralRestorer::new(model_path, use_gpu) {
-            Ok(restorer) => self.neural_restorer = Some(restorer),
-            Err(e) => log::error!("Failed to load neural restorer from {model_path}: {e}"),
-        }
         self
     }
 
@@ -2483,36 +2425,6 @@ impl FrameReconstructor {
         // pulls the complementary parity in.
         self.field_buf.copy_from_slice(frame);
 
-        #[cfg(feature = "neural-vsr")]
-        // Only run with a valid previous field (a complete interlaced
-        // frame). `take()` the restorer out so the persistent in/out
-        // scratch and `hidden_state` can be borrowed without aliasing
-        // `self.neural_restorer`; put it back afterwards.
-        if self.has_prev
-            && let Some(mut restorer) = self.neural_restorer.take()
-        {
-            for (dst, p) in self.neural_in.iter_mut().zip(frame.iter()) {
-                *dst = (((p >> 16) & 0xFF) as f32) / 255.0;
-            }
-            match restorer.process_frame_luma(
-                self.width,
-                self.height,
-                &self.neural_in,
-                self.neural_noise_level,
-                self.hidden_state.as_deref(),
-                &mut self.neural_out,
-            ) {
-                Ok(new_hidden) => {
-                    self.hidden_state = Some(new_hidden);
-                    for (px, y) in frame.iter_mut().zip(self.neural_out.iter()) {
-                        let c = (y.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-                        *px = 0xFF000000 | (c << 16) | (c << 8) | c;
-                    }
-                }
-                Err(e) => log::error!("Neural restorer failed: {}", e),
-            }
-            self.neural_restorer = Some(restorer);
-        }
         // Parity of the field just rendered, captured before the toggle:
         // the FieldMeta below describes THIS field, and reading
         // `self.field_parity` after `^= 1` stamped every history entry

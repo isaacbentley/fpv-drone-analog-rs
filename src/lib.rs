@@ -38,10 +38,8 @@
 //!
 //! - `gpu` — batches the sweep's per-probe down-conversion into a single
 //!   wgpu dispatch. Classification stays on the CPU.
-//! - `neural-vsr` — ONNX-based temporal restoration via `ort`.
 //!
-//! Both are disabled by default; the default build is CPU and rayon
-//! only.
+//! It is disabled by default; the default build is CPU and rayon only.
 //!
 //! # Example
 //!
@@ -72,8 +70,6 @@ pub mod gpu;
 pub mod impairments;
 pub mod levels;
 pub mod metrics;
-#[cfg(feature = "neural-vsr")]
-pub mod neural;
 pub mod scanner;
 pub mod synthetic;
 pub mod timing;

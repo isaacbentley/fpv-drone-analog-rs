@@ -91,14 +91,14 @@ math. Section references below point into it.
 
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = "0.8.0"
+orecchiette-fpv-drone-analog-rs = "0.10.0"
 num-complex = "0.4"
 ```
 
 To enable the GPU sweep:
 
 ```toml
-orecchiette-fpv-drone-analog-rs = { version = "0.8.0", features = ["gpu"] }
+orecchiette-fpv-drone-analog-rs = { version = "0.10.0", features = ["gpu"] }
 ```
 
 Construct one `GpuAnalog` and share it across detectors.
@@ -123,7 +123,7 @@ The crate owns the reusable receiver logic, from IQ slices through fields:
 
 | Module | Responsibility |
 | --- | --- |
-| `decode` | `DecodePlan` selects cutoff, FIR decimation and demodulator together. `StreamingFpvDecoder` owns DDC/demodulator continuity, deemphasis, timed reconstruction, optional restoration and telemetry. |
+| `decode` | `DecodePlan` selects cutoff, FIR decimation and demodulator together. `StreamingFpvDecoder` owns DDC/demodulator continuity, deemphasis, timed reconstruction, temporal denoising and telemetry. |
 | `acquisition` | Bounded contiguous probe records, PAL/NTSC resolution, carrier refinement inside the decode passband, and lock release based on fresh timing evidence. |
 | `scanner` | Tune coverage, packet budgets, configurable sensitive-sweep cadence, completion tracking, skip-aware candidate ranking and fine-tune fallback. |
 | `bands` | One catalog for scan coverage, names, aliases, parsing and candidate frequencies. |
