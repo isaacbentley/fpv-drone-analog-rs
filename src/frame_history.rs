@@ -125,8 +125,6 @@ impl FrameHistory {
         self.meta.push_back(meta);
     }
 
-    /// Number of fields currently held. Ranges from 0 (just
-    /// constructed) up to `capacity()`.
     /// Drop every retained field.
     ///
     /// Temporal denoise and dropout repair both assume the retained
@@ -140,12 +138,15 @@ impl FrameHistory {
         self.meta.clear();
     }
 
+    /// Number of fields currently held. Ranges from 0 (just
+    /// constructed) up to `capacity()`.
     pub fn len(&self) -> usize {
         self.y_fields.len()
     }
 
-    /// True when no fields have been pushed yet. The temporal
-    /// denoise and dropout-repair stages short-circuit on this.
+    /// True when no fields are held: none pushed yet, or none since
+    /// [`Self::clear`]. The temporal denoise and dropout-repair stages
+    /// short-circuit on this.
     pub fn is_empty(&self) -> bool {
         self.y_fields.is_empty()
     }

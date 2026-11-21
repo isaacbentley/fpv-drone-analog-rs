@@ -30,13 +30,17 @@
 //! (`build_phase_table`) — `f64`'s ~52-bit mantissa keeps `phase_adv *
 //! i0` accurate to a few times `1e-10` radians even at `i0` ~ 1e6, and
 //! there's no accumulation to drift because each value is computed
-//! independently rather than recursively. This table is `n_probes *
-//! out_len` `f64` multiply-and-wrap operations — a small fraction of the
-//! `n_probes * total_iq_len * num_taps` work the GPU shader does, so
-//! computing it on the CPU doesn't undercut the offload. The GPU kernel
-//! then only ever has to walk this anchor backward by up to `num_taps`
-//! (63) small, bounded steps to reach any tap in its window — negligible
-//! additional error (see `ddc_decimate.wgsl`'s doc comment).
+//! independently rather than recursively. The table is not cheap: it is
+//! `n_probes * out_len` entries, each an `f64` multiply-and-wrap plus a
+//! host `sin` and `cos`, computed serially on one CPU thread before the
+//! dispatch. By operation count that is `1/num_taps` of the shader's
+//! `n_probes * out_len * num_taps` multiply-adds, but those run spread
+//! across the GPU while the table's transcendentals run on one core, so
+//! in wall-clock time the table is a real share of a sweep, not a
+//! rounding error. The GPU kernel then only ever has to walk this anchor
+//! backward by up to `num_taps` (63) small, bounded steps to reach any
+//! tap in its window — negligible additional error (see
+//! `ddc_decimate.wgsl`'s doc comment).
 //!
 //! ## What stays on the CPU, unchanged
 //!

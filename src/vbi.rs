@@ -383,6 +383,8 @@ pub struct FieldSyncEvidence {
     /// `true` when at least two groups were found and every consecutive
     /// pair is spaced within 5% of a field period — i.e. this isn't
     /// just one lucky comb, it's a genuinely periodic vertical sync.
+    /// With no standard given, the field period is either standard's,
+    /// the same one for every pair.
     pub spacing_ok: bool,
     /// How many field periods the slice covers, for callers deciding
     /// how much evidence to expect (a short slice can't produce a
@@ -390,10 +392,19 @@ pub struct FieldSyncEvidence {
     pub slice_field_periods: f32,
 }
 
-/// Confirm periodic field-sync structure in a demod slice without
-/// committing to a PAL/NTSC standard up front (`is_pal: None` averages
-/// the two nominal line periods — the ~0.7% difference between them is
-/// far inside [`BROAD_SPACING_TOLERANCE`], so grouping still works).
+/// Confirm periodic field-sync structure in a demod slice, with or
+/// without a PAL/NTSC standard committed up front.
+///
+/// With `is_pal: None`, broad-pulse grouping uses the mean of the two
+/// nominal line periods — the ~0.7% difference between them is far
+/// inside [`BROAD_SPACING_TOLERANCE`], so grouping still works. The
+/// field-spacing test does not average: the NTSC and PAL field periods
+/// (16.68 ms and 20 ms) are ~18% apart, so their mean sits ~9% from
+/// both, outside the 5% spacing tolerance, and no real signal would
+/// match it. Instead the gaps between consecutive groups must all match
+/// one standard's field period, either one. `slice_field_periods` is
+/// measured against the mean of the two field periods.
+///
 /// Used by the detector's confidence boost: a slice with two or more
 /// field-period-spaced vertical syncs is essentially unfakeable by a
 /// non-video interferer, which is a stronger signal than the harmonic-
@@ -424,7 +435,19 @@ pub fn confirm_field_sync(
     };
     let nominal_period = sample_rate as f32 / nominal_line_hz as f32;
     let half_period = nominal_period * 0.5;
+    // Nominal field period behind `slice_field_periods`; with no
+    // standard, the mean of the two.
     let field_period_samples = field_total_lines as f32 * nominal_period;
+    let field_period_of =
+        |lines: f64, line_hz: f64| -> f32 { lines as f32 * (sample_rate as f32 / line_hz as f32) };
+    let pal_field = field_period_of(consts::PAL_FIELD_TOTAL_LINES, consts::PAL_LINE_HZ);
+    let ntsc_field = field_period_of(consts::NTSC_FIELD_TOTAL_LINES, consts::NTSC_LINE_HZ);
+    // Field periods the group spacing may match.
+    let spacing_periods: &[f32] = match is_pal {
+        Some(true) => &[pal_field],
+        Some(false) => &[ntsc_field],
+        None => &[ntsc_field, pal_field],
+    };
 
     let broads: Vec<&SyncPulse> = pulses
         .iter()
@@ -434,9 +457,11 @@ pub fn confirm_field_sync(
     let groups = group_ranges.len();
 
     let spacing_ok = groups >= 2
-        && group_ranges.windows(2).all(|w| {
-            let gap = broads[w[1].0].start as f32 - broads[w[0].0].start as f32;
-            (gap - field_period_samples).abs() < field_period_samples * 0.05
+        && spacing_periods.iter().any(|&field_period| {
+            group_ranges.windows(2).all(|w| {
+                let gap = broads[w[1].0].start as f32 - broads[w[0].0].start as f32;
+                (gap - field_period).abs() < field_period * 0.05
+            })
         });
 
     FieldSyncEvidence {
@@ -446,27 +471,10 @@ pub fn confirm_field_sync(
     }
 }
 
-/// Parse a demod slice's vertical-sync structure: locate the serrated
-/// broad-pulse group, determine field parity, and derive where active
-/// video starts.
-///
-/// Parity is determined by direct hypothesis test, not by fitting a
-/// phase against an independently-indexed local grid: this field's own
-/// plain-blanking H-sync pulses start immediately after the
-/// vertical-sync group at a fixed cadence *regardless of parity* (the
-/// generator in [`crate::synthetic`] — and real broadcast video —
-/// only encodes the half-line difference in *where active video
-/// starts* relative to that cadence, not in the cadence's phase
-/// against `broad_start`). So rather than fit a grid and read off a
-/// phase, this computes both standards' predicted active-video start
-/// (`broad_to_active` lines, or that plus half a line) and checks
-/// which one an actual H-sync pulse confirms.
-///
-/// Returns `None` when no run of at least [`MIN_BROAD_RUN`] half-line-
-/// spaced broad pulses is found at all — callers should fall back to
-/// whatever less-structural vsync detection they already have (real
-/// VBI is dirtier than the spec on cheap FPV cameras; only the broad
-/// group is treated as load-bearing here). A `Some` result's `parity`
+/// Measure one broad-pulse group, `broads[gi..=gj]`: count the
+/// equalizing pulses either side of it, refine the line period from the
+/// field's own H-sync pulses, and resolve parity and the active-video
+/// start by the hypothesis test described on [`find_vertical_sync`].
 fn parse_broad_group(
     pulses: &[SyncPulse],
     broads: &[&SyncPulse],
@@ -492,8 +500,8 @@ fn parse_broad_group(
     // Refine the line period from this field's own plain H-sync pulses
     // (prefer after the group — guaranteed present in any single-
     // field-plus slice — falling back to before it). Only the period
-    // is used from this fit; see the doc comment on why an intercept-
-    // based phase can't carry parity here.
+    // is used from this fit; see `find_vertical_sync`'s doc on why an
+    // intercept-based phase can't carry parity here.
     let fitted_period = fit_h_grid(pulses, nominal_period, last_start + nominal_period * 3.0)
         .or_else(|| fit_h_grid(pulses, nominal_period, broad_start - nominal_period * 3.0));
     let period_for_datum = fitted_period.unwrap_or(nominal_period);
@@ -623,10 +631,27 @@ pub fn find_vertical_sync_near(
 
 /// Parse a demod slice's vertical-sync structure: locate the serrated
 /// broad-pulse group, determine field parity, and derive where active
-/// video starts.
+/// video starts. Takes the first qualifying group in the slice;
+/// [`find_vertical_sync_candidates`] returns all of them.
+///
+/// Parity is determined by direct hypothesis test, not by fitting a
+/// phase against an independently-indexed local grid: this field's own
+/// plain-blanking H-sync pulses start immediately after the
+/// vertical-sync group at a fixed cadence *regardless of parity* (the
+/// generator in [`crate::synthetic`] — and real broadcast video —
+/// only encodes the half-line difference in *where active video
+/// starts* relative to that cadence, not in the cadence's phase
+/// against `broad_start`). So rather than fit a grid and read off a
+/// phase, this computes both standards' predicted active-video start
+/// (`broad_to_active` lines, or that plus half a line) and checks
+/// which one an actual H-sync pulse confirms.
 ///
 /// Returns `None` when no run of at least [`MIN_BROAD_RUN`] half-line-
-/// spaced broad pulses is found at all.
+/// spaced broad pulses is found at all — callers should fall back to
+/// whatever less-structural vsync detection they already have (real
+/// VBI is dirtier than the spec on cheap FPV cameras; only the broad
+/// group is treated as load-bearing here). A `Some` result's `parity`
+/// field can still independently be `None` (see its doc).
 pub fn find_vertical_sync(
     demod: &[f32],
     sample_rate: u32,
@@ -751,5 +776,28 @@ mod tests {
         let info = find_vertical_sync(&data, cfg.sample_rate, &levels, false)
             .expect("expected a parse under noise");
         assert_eq!(info.parity, Some(FieldParity::Second));
+    }
+
+    /// With no standard committed, field-period-spaced groups confirm for
+    /// either standard. The mean of the two field periods sits ~9% from
+    /// both, outside the 5% tolerance, so a test against it would confirm
+    /// neither.
+    #[test]
+    fn confirm_field_sync_without_a_standard_accepts_either_field_period() {
+        for is_pal in [false, true] {
+            let cfg = synth_config(is_pal, FieldParity::First);
+            let data = generate_fields(&cfg, 3);
+            let levels = levels_for(&cfg);
+            let unknown = confirm_field_sync(&data, cfg.sample_rate, &levels, None);
+            assert!(unknown.groups >= 2, "is_pal={is_pal}: {unknown:?}");
+            assert!(unknown.spacing_ok, "is_pal={is_pal}: {unknown:?}");
+
+            let right = confirm_field_sync(&data, cfg.sample_rate, &levels, Some(is_pal));
+            assert!(right.spacing_ok, "is_pal={is_pal}: {right:?}");
+            // The other standard's field period is ~18% off and must not
+            // confirm: the test discriminates rather than passing anything.
+            let wrong = confirm_field_sync(&data, cfg.sample_rate, &levels, Some(!is_pal));
+            assert!(!wrong.spacing_ok, "is_pal={is_pal}: {wrong:?}");
+        }
     }
 }

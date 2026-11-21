@@ -2,7 +2,8 @@ use crate::types::{DetectionResult, SignalType};
 use num_complex::Complex;
 use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::f32::consts::PI;
 
 /// Target decimated rate for each sliding-DDC probe, and the boundary
@@ -1147,16 +1148,25 @@ impl AnalogFpvDetector {
 /// Noncoherent cross-batch spectrum accumulator for the `_integrated`
 /// detection entry points.
 ///
-/// Keyed by absolute frequency (rounded to a 1 MHz bucket, so probe-grid
-/// jitter between sweeps lands in the same bucket), each bucket holds a
-/// running average of the FM-demod magnitude spectrum. A real signal's
-/// sync comb sits in the same bins batch after batch while noise
+/// Keyed by absolute frequency floored to the whole MHz (`key_hz`
+/// `div_euclid` 1 MHz), so a probe that comes back to the same frequency
+/// on a later sweep, give or take a sub-MHz difference that does not
+/// cross a whole-MHz boundary, folds into the same bucket. Each bucket
+/// holds a running average of the FM-demod magnitude spectrum. A real
+/// signal's sync comb sits in the same bins batch after batch while noise
 /// magnitudes average toward their mean, so after N batches the
 /// comb-to-floor contrast improves ~√N — several dB of detection
 /// sensitivity that no single ~68 ms batch can provide. The averaging is
 /// a cumulative mean up to `window` batches, then an EWMA with
 /// `α = 1/window`, so stale signals fade rather than pinning the bucket
 /// forever.
+///
+/// The bucket count is capped at 1024 with least-recently-used
+/// eviction. Integration across sweeps only happens if every bucket a
+/// sweep touches is still held when the next sweep comes back to it, so
+/// the cap has to hold a whole sweep: a cyclic sweep over more distinct
+/// buckets than the cap evicts each one before its revisit, under LRU as
+/// under any other policy.
 ///
 /// One integrator per capture chain: buckets assume a consistent FFT
 /// length per frequency, and a changed capture configuration should
@@ -1165,15 +1175,29 @@ pub struct SpectralIntegrator {
     window: u32,
     max_buckets: usize,
     buckets: HashMap<i64, SpectralBucket>,
-    /// First-insertion order, for cheap oldest-bucket eviction at the
-    /// `max_buckets` cap (a runaway hop list shouldn't grow memory
-    /// unboundedly — each bucket holds a full magnitude spectrum).
-    insertion_order: VecDeque<i64>,
+    /// Use counter, advanced on every `accumulate`. Each bucket records
+    /// the value at its last use, and the bucket holding the smallest is
+    /// the least recently used one evicted at the cap.
+    clock: u64,
 }
+
+/// Bucket cap for [`SpectralIntegrator`].
+///
+/// Sized from the largest plan the crate builds: `plan_tune_centers`
+/// over every `channel_catalog()` entry, at a span of 0.8 of the capture
+/// rate, touches 400 distinct buckets per sweep at 25 MSPS, 480 at
+/// 30.72 MSPS and 529 at 61.44 MSPS (the probe count per tune centre
+/// grows with the rate faster than the centre count falls). 1024 holds
+/// that with room to spare. The cap bounds memory, since each bucket
+/// holds a full magnitude spectrum: with 65,536-sample packets a wideband
+/// probe's spectrum is 16,384-32,768 `f32`, so an all-bands sweep holds
+/// roughly 33-60 MiB.
+const DEFAULT_MAX_BUCKETS: usize = 1024;
 
 struct SpectralBucket {
     mags: Vec<f32>,
     count: u32,
+    last_used: u64,
 }
 
 impl SpectralIntegrator {
@@ -1183,40 +1207,48 @@ impl SpectralIntegrator {
     pub fn new(window: u32) -> Self {
         Self {
             window: window.max(1),
-            max_buckets: 256,
+            max_buckets: DEFAULT_MAX_BUCKETS,
             buckets: HashMap::new(),
-            insertion_order: VecDeque::new(),
+            clock: 0,
         }
     }
 
     /// Drop all accumulated state (retune, capture-config change).
     pub fn reset(&mut self) {
         self.buckets.clear();
-        self.insertion_order.clear();
     }
 
     /// Fold `fresh` into the bucket for `key_hz` and return the
     /// averaged spectrum. A length mismatch (changed capture length for
-    /// this frequency) restarts the bucket from `fresh`.
+    /// this frequency) restarts the bucket from `fresh`. Inserting a new
+    /// bucket at the cap first evicts the least recently used one.
     fn accumulate(&mut self, key_hz: i64, fresh: &[f32]) -> &[f32] {
         let key = key_hz.div_euclid(1_000_000);
-        if !self.buckets.contains_key(&key) {
-            if self.insertion_order.len() >= self.max_buckets
-                && let Some(evict) = self.insertion_order.pop_front()
-            {
-                self.buckets.remove(&evict);
-            }
-            self.insertion_order.push_back(key);
-            self.buckets.insert(
-                key,
-                SpectralBucket {
-                    mags: fresh.to_vec(),
-                    count: 1,
-                },
-            );
-            return &self.buckets[&key].mags;
+        self.clock += 1;
+        let now = self.clock;
+        if self.buckets.len() >= self.max_buckets
+            && !self.buckets.contains_key(&key)
+            && let Some(lru) = self
+                .buckets
+                .iter()
+                .min_by_key(|(_, b)| b.last_used)
+                .map(|(&k, _)| k)
+        {
+            self.buckets.remove(&lru);
         }
-        let bucket = self.buckets.get_mut(&key).expect("checked above");
+        let bucket = match self.buckets.entry(key) {
+            Entry::Vacant(slot) => {
+                return &slot
+                    .insert(SpectralBucket {
+                        mags: fresh.to_vec(),
+                        count: 1,
+                        last_used: now,
+                    })
+                    .mags;
+            }
+            Entry::Occupied(slot) => slot.into_mut(),
+        };
+        bucket.last_used = now;
         if bucket.mags.len() != fresh.len() {
             bucket.mags.clear();
             bucket.mags.extend_from_slice(fresh);
@@ -1261,7 +1293,7 @@ impl SpectralIntegrator {
 /// apart.
 const DEDUP_RADIUS_HZ: f64 = 2e6;
 
-/// Merge detections that fall within [`DEDUP_BW_HZ`] of each other,
+/// Merge detections that fall within [`DEDUP_RADIUS_HZ`] of a group's anchor,
 /// keeping the strongest (highest confidence, then highest RSSI) member
 /// of each group. `results` must already be sorted by frequency.
 ///
@@ -1373,10 +1405,12 @@ impl AnalogFpvDetector {
 
     /// [`Self::detect_from_iq_integrated`], additionally handing back every
     /// probe the sweep measured in `probes_out` (cleared first), in
-    /// ascending `offset_hz` order. Left empty for captures the detector
-    /// treats as a single slice (below the ~25 MSPS boundary described in
-    /// the crate docs), where there is no probe grid. Costs nothing the
-    /// sweep did not already do.
+    /// ascending `offset_hz` order. Captures the detector classifies as a
+    /// single slice have no probe grid: above 10 MSPS and below 22.5 MSPS
+    /// (fewer than four probe positions) `probes_out` holds exactly one
+    /// probe, at offset 0 with the slice's energy and confidence, and at
+    /// 10 MSPS or below (or under 2048 samples) it is left empty. Costs
+    /// nothing the sweep did not already do.
     pub fn detect_from_iq_integrated_with_probes(
         &self,
         iq_data: &[Complex<f32>],
@@ -1509,16 +1543,17 @@ impl AnalogFpvDetector {
             // itself; its `target_rate/3` passband stays inside Nyquist.
             let n_steps = ((scan_end - scan_start) / step_hz).round() as usize + 1;
 
-            // A 10–25 MHz capture yields only 1–3 probe positions — too
-            // few for the percentile noise floor below to mean anything
-            // (`sorted_e[len/4]` was 0.0 for < 4 probes, which let the
-            // strongest probe through the gate on a completely empty
-            // band, every batch). A video signal is ~20 MHz wide anyway,
-            // so at these rates it spans the whole capture: classify the
-            // capture as one baseband slice at the tuned centre instead,
-            // exactly like the ≤ 10 MHz fast path. This also reports ONE
-            // stable frequency (the centre) rather than 2-3 fake probe
-            // offsets that deduped into separate detections downstream.
+            // A capture above 10 and below 22.5 MSPS yields only 1–3
+            // probe positions — too few for the percentile noise floor
+            // below to mean anything (`sorted_e[len/4]` was 0.0 for < 4
+            // probes, which let the strongest probe through the gate on
+            // a completely empty band, every batch). A video signal is
+            // ~20 MHz wide anyway, so at these rates it spans the whole
+            // capture: classify the capture as one baseband slice at the
+            // tuned centre instead, exactly like the ≤ 10 MHz fast path.
+            // This also reports ONE stable frequency (the centre) rather
+            // than 2-3 fake probe offsets that deduped into separate
+            // detections downstream.
             if n_steps < 4 {
                 let (sig_type, conf) = match integration.as_deref_mut() {
                     Some(integ) => self.detect_sync_pulses_integrated(
@@ -1842,7 +1877,8 @@ impl AnalogFpvDetector {
                 });
             }
         }
-        // Final dedup: merge any results within 20 MHz, keep strongest
+        // Final dedup: merge results within DEDUP_RADIUS_HZ (2 MHz) of a
+        // group's anchor, keeping the strongest
         final_results.sort_by(|a, b| {
             (a.frequency_hz as f64)
                 .partial_cmp(&(b.frequency_hz as f64))
@@ -2447,7 +2483,7 @@ mod tests {
         assert_eq!(class, None);
     }
 
-    /// A 10–25 MHz capture (too narrow for a meaningful probe sweep)
+    /// A 10–22.5 MSPS capture (too narrow for a meaningful probe sweep)
     /// must classify the whole slice and report the TUNED CENTRE, not
     /// a probe-grid offset. At 15.36 MSPS the old sweep had exactly two
     /// probes (centre −2.68 / +2.32 MHz) whose fake frequencies deduped
@@ -2751,10 +2787,108 @@ mod integration_tests {
         // Bucket cap: hammering more distinct frequencies than
         // max_buckets must evict, not grow unboundedly.
         let tiny = vec![0.0f32; 8];
-        for k in 0..300i64 {
+        for k in 0..(integ.max_buckets as i64 + 50) {
             integ.accumulate(k * 1_000_000, &tiny);
         }
-        assert!(integ.buckets.len() <= integ.max_buckets);
+        assert_eq!(integ.buckets.len(), integ.max_buckets);
+    }
+
+    /// One all-bands sweep touches 400-529 buckets (see
+    /// `DEFAULT_MAX_BUCKETS`). A sweep cycling over that many distinct
+    /// frequencies has to find every bucket still there on the next
+    /// pass, or cross-sweep integration never gets past one batch.
+    #[test]
+    fn integrator_holds_a_whole_all_bands_sweep_across_revisits() {
+        let mut integ = SpectralIntegrator::new(4);
+        let n_buckets = 600i64;
+        assert!(n_buckets as usize > 256 && (n_buckets as usize) < integ.max_buckets);
+        let ones = vec![1.0f32; 16];
+        let threes = vec![3.0f32; 16];
+        for k in 0..n_buckets {
+            integ.accumulate(1_000_000_000 + k * 1_000_000, &ones);
+        }
+        for k in 0..n_buckets {
+            let avg = integ.accumulate(1_000_000_000 + k * 1_000_000, &threes);
+            assert!(
+                (avg[0] - 2.0).abs() < 1e-6,
+                "bucket {k} restarted instead of integrating: {}",
+                avg[0]
+            );
+        }
+        assert_eq!(integ.buckets.len(), n_buckets as usize);
+    }
+
+    /// Pins `DEFAULT_MAX_BUCKETS` against the plan it is sized for: the
+    /// distinct integrator keys one all-bands sweep produces, using the
+    /// sweep's probe grid (5 MHz steps, 5 MHz edge margin, single slice
+    /// below four probes) over `plan_tune_centers` at a 0.8-of-rate span.
+    #[test]
+    fn all_bands_sweep_fits_the_bucket_cap() {
+        let channels: Vec<f64> = crate::bands::BandSelection::All
+            .channels()
+            .map(|c| c.frequency_hz as f64)
+            .collect();
+        let mut widest = 0usize;
+        for fs in [15.36e6, 20e6, 25e6, 30.72e6, 40e6, 56e6, 61.44e6] {
+            let centers = crate::scanner::plan_tune_centers(&channels, fs * 0.8);
+            let step = 5e6f64;
+            let scan_start = -fs / 2.0 + step;
+            let n_steps = ((fs - 2.0 * step) / step).round() as usize + 1;
+            let mut keys = std::collections::HashSet::new();
+            for c in centers {
+                let center = c as u64 as i64;
+                if n_steps < 4 {
+                    keys.insert(center.div_euclid(1_000_000));
+                } else {
+                    for k in 0..n_steps {
+                        let offset = scan_start + k as f64 * step;
+                        keys.insert((center + offset as i64).div_euclid(1_000_000));
+                    }
+                }
+            }
+            widest = widest.max(keys.len());
+        }
+        assert!(widest > 256, "plan no longer exceeds the old cap: {widest}");
+        assert!(
+            widest <= DEFAULT_MAX_BUCKETS,
+            "an all-bands sweep touches {widest} buckets, over the {DEFAULT_MAX_BUCKETS} cap"
+        );
+    }
+
+    /// At the cap, the bucket evicted is the least recently *used*, not
+    /// the first inserted: a frequency revisited during the sweep keeps
+    /// its history while one left untouched goes.
+    #[test]
+    fn integrator_evicts_least_recently_used_bucket() {
+        let mut integ = SpectralIntegrator::new(4);
+        let cap = integ.max_buckets as i64;
+        let v = vec![1.0f32; 4];
+        for k in 0..cap {
+            integ.accumulate(k * 1_000_000, &v);
+        }
+        // Touch the oldest bucket, making key 1 the least recent.
+        integ.accumulate(0, &v);
+        integ.accumulate(cap * 1_000_000, &v);
+        assert_eq!(integ.buckets.len(), integ.max_buckets);
+        assert!(
+            integ.buckets.contains_key(&0),
+            "recently used bucket evicted"
+        );
+        assert!(!integ.buckets.contains_key(&1), "LRU bucket survived");
+        assert_eq!(integ.buckets[&0].count, 2);
+    }
+
+    /// Keys floor to the MHz: anywhere inside one whole MHz shares a
+    /// bucket, and the next MHz starts a new one.
+    #[test]
+    fn integrator_floors_keys_to_the_mhz() {
+        let mut integ = SpectralIntegrator::new(4);
+        let v = vec![1.0f32; 4];
+        integ.accumulate(5_800_000_000, &v);
+        integ.accumulate(5_800_999_999, &v);
+        integ.accumulate(5_801_000_000, &v);
+        assert_eq!(integ.buckets.len(), 2);
+        assert_eq!(integ.buckets[&5_800].count, 2);
     }
 }
 

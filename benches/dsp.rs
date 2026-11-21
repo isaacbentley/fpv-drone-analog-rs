@@ -108,5 +108,11 @@ fn bench_levels(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_detection, bench_reconstruction, bench_ddc, bench_levels);
+criterion_group!(
+    benches,
+    bench_detection,
+    bench_reconstruction,
+    bench_ddc,
+    bench_levels
+);
 criterion_main!(benches);

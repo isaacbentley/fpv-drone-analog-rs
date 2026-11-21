@@ -198,8 +198,9 @@ fn pattern_ire(pattern: &TestPattern, active_line_idx: usize, col: usize) -> f32
     }
 }
 
+/// One xorshift64 step mapped to a uniform draw on `[0, 1]`.
 #[inline]
-fn xorshift01(state: &mut u64) -> f32 {
+pub(crate) fn xorshift01(state: &mut u64) -> f32 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;

@@ -93,10 +93,10 @@ use std::time::Duration;
 /// ```
 ///
 /// So two packets is the right *fast pass* and the wrong *verdict*: at
-/// σ 1.5 it finds a quarter of what eight finds. Hops that show energy
-/// So two packets is the right fast pass at a wide capture rate and the
-/// wrong verdict at a narrow one, where a packet is four times the
-/// signal for a third of the cost — see [`detect_packets_per_hop`].
+/// σ 1.5 it finds a quarter of what eight finds. It is the right fast
+/// pass at a wide capture rate and the wrong verdict at a narrow one,
+/// where a packet is four times the signal for two-fifths of the cost —
+/// see [`detect_packets_per_hop`].
 ///
 /// The cost is CPU, not time on air: two packets is ~5.2 ms of signal at
 /// 25 MSPS but ~18 ms of detection work, so a hop becomes CPU-bound
@@ -108,8 +108,16 @@ pub const DETECT_PACKETS_PER_HOP: usize = 2;
 /// entirely on the rate: 1.07 ms of signal at 61.44 MSPS against 4.27 ms
 /// at 15.36, and it costs 6.41 ms of detector against 2.49. Narrow
 /// captures are the case where more packets are both more useful and
-/// cheaper, and six of them is 14.9 ms of CPU inside a 25 ms dwell —
-/// where six at 61.44 MSPS would be 38.5 ms and miss the hop entirely.
+/// cheaper: six of them is 14.9 ms of CPU at 15.36 MSPS, where six at
+/// 61.44 MSPS would be 38.5 ms.
+///
+/// CPU is not the only cost. Six packets are also 6 · 65,536 samples of
+/// signal the source has to deliver inside the hop: 25.6 ms at
+/// 15.36 MSPS, 19.7 ms at 20 MSPS, 12.8 ms at 30.72 MSPS. A source's
+/// dwell has to cover that signal time (plus whatever settle precedes the
+/// first packet) as well as the detector time, or the hop ends short of
+/// its budget and [`ScanProgress`] never counts it complete. At
+/// 15.36 MSPS a 25 ms dwell is already too short.
 ///
 /// Six because integration needs the room. Measured against a real A1
 /// transmitter attenuated toward its cliff, a 15.36 MSPS capture that

@@ -8,10 +8,11 @@
 //! # Detection
 //!
 //! [`detector::AnalogFpvDetector`] implements [`detector::FpvDetector`].
-//! Its strategy follows the sample rate: at or above 25 MSPS a sliding
-//! down-converter sweeps the capture on a 5 MHz probe grid; below that
-//! the grid yields too few probes, so the capture is classified as a
-//! single baseband slice at the tuned centre.
+//! Its strategy follows the sample rate: at or above 22.5 MSPS (where
+//! the grid has at least four probe positions) a sliding down-converter
+//! sweeps the capture on a 5 MHz probe grid; below that the grid yields
+//! too few probes, so the capture is classified as a single baseband
+//! slice at the tuned centre.
 //!
 //! Detections carry a confidence from 0.6 to 0.95, rising as the
 //! horizontal sync bin resolves PAL from NTSC and as vertical sync

@@ -57,7 +57,7 @@ graph TD
 ## 3. Detection Logic
 
 ### Single-Slice Baseband Path
-When `sample_rate <= WIDEBAND_TARGET_RATE_HZ` (10 MHz), the signal is assumed to already be isolated at baseband and the detector runs FM demodulation and sync pulse detection directly — the sweep's 5 MHz step + 5 MHz edge margin can't form a meaningful probe grid below that rate. Captures between ~10 and ~25 MSPS (fewer than 4 probe positions, too few for the percentile noise floor) are likewise classified as one baseband slice at the tuned centre; a video signal is ~20 MHz wide and spans the whole capture at those rates anyway.
+When `sample_rate <= WIDEBAND_TARGET_RATE_HZ` (10 MHz), the signal is assumed to already be isolated at baseband and the detector runs FM demodulation and sync pulse detection directly — the sweep's 5 MHz step + 5 MHz edge margin can't form a meaningful probe grid below that rate. Captures above 10 and below 22.5 MSPS (fewer than 4 probe positions, too few for the percentile noise floor) are likewise classified as one baseband slice at the tuned centre; a video signal is ~20 MHz wide and spans the whole capture at those rates anyway.
 
 ### Wideband Sliding DDC Probe
 For wideband captures (e.g., 100 MSPS), the detector sweeps the entire capture bandwidth:
@@ -263,7 +263,11 @@ without losing lock. `find_vertical_sync` takes the first such group;
 `confirm_field_sync` (used by the detector) takes *all* of them and
 checks that consecutive groups land a full field period apart —
 essentially unfakeable by a non-video interferer, since it demands two
-independent field-length-separated confirmations, not just one.
+independent field-length-separated confirmations, not just one. With
+the standard not yet known (`AnalogVideoUnknown`), every gap must match
+one standard's field period, either one: the mean of the two (16.68 and
+20 ms) sits ~9% from each, outside the 5% spacing tolerance, and would
+match neither.
 
 Field parity — which of the two interlaced fields a slice belongs to
 — is *not* recovered by fitting a phase against an independently-
@@ -547,10 +551,11 @@ proves insufficient in the field.
 ## 11. Cross-Batch Spectral Integration
 
 A single ~68 ms batch bounds single-shot sensitivity. `SpectralIntegrator`
-holds, per absolute-frequency bucket (1 MHz rounding, 256-bucket LRU cap),
-a running average of the FM-demod **magnitude** spectrum: a real signal's
-sync comb lands in the same bins batch after batch while noise magnitudes
-average toward their mean, so comb-to-floor contrast improves ~√N.
+holds, per absolute-frequency bucket (frequency floored to the whole MHz,
+1024-bucket LRU cap), a running average of the FM-demod **magnitude**
+spectrum: a real signal's sync comb lands in the same bins batch after
+batch while noise magnitudes average toward their mean, so comb-to-floor
+contrast improves ~√N.
 Magnitudes — not complex bins — because batches share no phase reference;
 this is classic noncoherent (post-detection) integration.
 
@@ -566,6 +571,12 @@ this is classic noncoherent (post-detection) integration.
   (`integration_detects_where_single_batches_cannot`) pins the win: at a
   noise level where four independent single batches all fail, four
   integrated batches classify at full 0.8 confidence.
+- Integration across sweeps needs every bucket a sweep touches to still
+  be held on the next pass. One sweep over every catalogue channel
+  (`plan_tune_centers` at a 0.8-of-rate span) touches 400 buckets at
+  25 MSPS and 529 at 61.44 MSPS, so the cap is sized above that; a
+  cyclic sweep over more buckets than the cap would evict each one before
+  its revisit regardless of eviction policy.
 - fpv-viewer-rs feeds one integrator per scan session (persisting across
   sweeps and rescans) and gives single-channel standard detection up to 4
   chunks of patience before settling for an ambiguous answer.

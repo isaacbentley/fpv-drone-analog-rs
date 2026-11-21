@@ -48,12 +48,27 @@ pub const DEFAULT_FIR_TAPS: usize = 63;
 ///
 /// `num_taps` is clamped to a minimum of 3 (see [`StreamingDDC::with_taps`]
 /// for why) and `sample_rate` to a minimum of 1 Hz.
+///
+/// A cutoff at or above Nyquist (`cutoff_hz >= sample_rate / 2`) asks
+/// for no band-limiting at all, and yields a unit impulse at tap
+/// `num_taps / 2`: unity gain at every frequency, the same tap count, and
+/// (for the odd tap counts every caller uses) the same `(num_taps-1)/2`
+/// group delay as a designed filter. The windowed sinc cannot express
+/// that cutoff. For integer `n`, `sin(2π·c·n) = −sin(2π·(1−c)·n)`, so a
+/// normalised cutoff `c ≥ 0.5` designs `2δ − LP(1−c)`: flat to `1−c`,
+/// then rising to +6 dB at Nyquist. `analyze_tuned_channel` and
+/// `analyze_channel_standard` reach this whenever the capture rate is
+/// below `2·(deviation + LUMA_HEADROOM_HZ)`.
 pub(crate) fn design_fir_taps(cutoff_hz: f32, sample_rate: u32, num_taps: usize) -> Vec<f32> {
     let num_taps = num_taps.max(3);
     let sample_rate = sample_rate.max(1);
     let cutoff_norm = cutoff_hz / sample_rate as f32;
-    let m = (num_taps - 1) as f32 / 2.0;
     let mut taps = vec![0.0f32; num_taps];
+    if cutoff_norm >= 0.5 {
+        taps[num_taps / 2] = 1.0;
+        return taps;
+    }
+    let m = (num_taps - 1) as f32 / 2.0;
     for i in 0..num_taps {
         let n = i as f32 - m;
         // Windowed sinc — exact value at n=0 is `2·cutoff_norm`
@@ -230,8 +245,6 @@ impl StreamingDDC {
         taps_dup
     }
 
-    /// Number of FIR taps; used by callers that need to allocate a
-    /// matching scratch buffer.
     /// Clear the filter state after a break in the signal.
     ///
     /// The delay line holds the last `num_taps` samples and convolves
@@ -253,6 +266,8 @@ impl StreamingDDC {
         self.decimation_counter = 0;
     }
 
+    /// Number of FIR taps; used by callers that need to allocate a
+    /// matching scratch buffer.
     pub fn num_taps(&self) -> usize {
         self.taps.len()
     }
@@ -694,6 +709,45 @@ mod tests {
                 "fs={fs} cutoff={cutoff}: DDC output contains non-finite samples"
             );
         }
+    }
+
+    /// A cutoff at or above Nyquist passes everything through: a unit
+    /// impulse at the centre tap, flat at unity gain to Nyquist. The
+    /// windowed sinc would design `2δ − LP(1−c)` there, +6 dB at
+    /// Nyquist. 8 MHz at 15.36 MSPS is `analyze_tuned_channel`'s
+    /// passband for a 6 MHz deviation.
+    #[test]
+    fn cutoff_at_or_above_nyquist_is_a_pass_through() {
+        let gain_at = |taps: &[f32], f_norm: f64| -> f64 {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (k, &t) in taps.iter().enumerate() {
+                let w = -2.0 * std::f64::consts::PI * f_norm * k as f64;
+                re += f64::from(t) * w.cos();
+                im += f64::from(t) * w.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        for (cutoff, fs, n) in [
+            (8e6f32, 15_360_000u32, 63usize),
+            (7_680_000.0, 15_360_000, 63),
+            (20e6, 15_360_000, 127),
+            (0.6e6, 1_000_000, 31),
+        ] {
+            let taps = design_fir_taps(cutoff, fs, n);
+            assert_eq!(taps.len(), n);
+            for (k, &t) in taps.iter().enumerate() {
+                let want = if k == n / 2 { 1.0 } else { 0.0 };
+                assert_eq!(t, want, "cutoff {cutoff} at {fs}: tap {k} = {t}");
+            }
+            for f in [0.0, 0.1, 0.25, 0.4, 0.5] {
+                let g = gain_at(&taps, f);
+                assert!((g - 1.0).abs() < 1e-9, "gain {g} at {f}·fs");
+            }
+        }
+        // Just below Nyquist is still a designed low-pass, not an impulse.
+        let taps = design_fir_taps(0.45 * 15_360_000.0, 15_360_000, 63);
+        assert!(taps[31] < 1.0 && taps[30].abs() > 1e-3);
+        assert!(gain_at(&taps, 0.5) < 0.6);
     }
 
     /// Phasor magnitude should stay on the unit circle across long

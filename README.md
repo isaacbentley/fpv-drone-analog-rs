@@ -168,7 +168,7 @@ for res in &results {
 }
 ```
 
-Above roughly 25 MSPS the sliding down-converter sweeps the full
+From 22.5 MSPS up the sliding down-converter sweeps the full
 bandwidth and may return several signals at arbitrary frequencies. Below
 that there are too few probe positions to form a grid, and the capture is
 classified as a single slice at the tuned centre frequency, which suits

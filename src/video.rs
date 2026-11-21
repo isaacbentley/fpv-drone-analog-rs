@@ -927,14 +927,6 @@ impl FrameReconstructor {
         self.last_rendered_parity
     }
 
-    /// Override the temporal history window size. Default is
-    /// [`DEFAULT_TEMPORAL_WINDOW`] (5 fields, ~83 ms latency, ~+7 dB
-    /// SNR on static regions). Set to 1 or 0 to disable temporal
-    /// denoise + dropout repair (offline-decode and unit-test
-    /// scenarios). Larger windows improve SNR by √N at the cost of
-    /// latency and memory; 8 is a reasonable upper bound for live
-    /// surveillance / recon use.
-    ///
     /// Forget everything that assumes the last field and the next one
     /// are consecutive.
     ///
@@ -993,6 +985,14 @@ impl FrameReconstructor {
         }
     }
 
+    /// Override the temporal history window size. Default is
+    /// [`DEFAULT_TEMPORAL_WINDOW`] (5 fields, ~83 ms latency, ~+7 dB
+    /// SNR on static regions). Set to 1 or 0 to disable temporal
+    /// denoise + dropout repair (offline-decode and unit-test
+    /// scenarios). Larger windows improve SNR by √N at the cost of
+    /// latency and memory; 8 is a reasonable upper bound for live
+    /// surveillance / recon use.
+    ///
     /// Builder-style: returns `self` so callers can chain with
     /// `FrameReconstructor::new(...).with_temporal_window(2)`.
     pub fn with_temporal_window(mut self, window: usize) -> Self {

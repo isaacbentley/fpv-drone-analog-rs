@@ -2,8 +2,14 @@
 
 /// Computes Peak Signal-to-Noise Ratio (PSNR) between a test frame and a ground truth frame.
 /// Both frames should be packed `u32` (e.g. ARGB/XRGB). We extract the lower 8 bits (Luma) for comparison.
+///
+/// Returns `f64::INFINITY` for a perfect match, and for two empty frames,
+/// which have no pixel that differs.
 pub fn compute_psnr(test: &[u32], truth: &[u32]) -> f64 {
     assert_eq!(test.len(), truth.len());
+    if test.is_empty() {
+        return f64::INFINITY;
+    }
     let mut mse = 0.0f64;
     for (a, b) in test.iter().zip(truth.iter()) {
         let diff = (a & 0xFF) as f64 - (b & 0xFF) as f64;
@@ -18,6 +24,10 @@ pub fn compute_psnr(test: &[u32], truth: &[u32]) -> f64 {
 
 /// Computes the Pearson correlation coefficient of spatial gradients (Sobel-like) between two frames.
 /// The frames must have the given `width` and `height`.
+///
+/// Returns 0.0 when there are no gradients to correlate (either dimension
+/// below 2, including an empty frame) or when either frame's gradients
+/// have zero variance.
 pub fn compute_gradient_correlation(
     test: &[u32],
     truth: &[u32],
@@ -31,11 +41,16 @@ pub fn compute_gradient_correlation(
     let mut mean_test = 0.0f64;
     let mut mean_truth = 0.0f64;
 
-    let mut grads_test = Vec::with_capacity((width - 1) * (height - 1));
-    let mut grads_truth = Vec::with_capacity((width - 1) * (height - 1));
+    // Forward differences need a right and a lower neighbour, so the
+    // gradient grid is one smaller than the frame each way; saturating
+    // keeps a zero dimension at an empty grid instead of underflowing.
+    let grad_w = width.saturating_sub(1);
+    let grad_h = height.saturating_sub(1);
+    let mut grads_test = Vec::with_capacity(grad_w * grad_h);
+    let mut grads_truth = Vec::with_capacity(grad_w * grad_h);
 
-    for y in 0..(height - 1) {
-        for x in 0..(width - 1) {
+    for y in 0..grad_h {
+        for x in 0..grad_w {
             let idx = y * width + x;
 
             let t_xy = (test[idx] & 0xFF) as f64;
@@ -78,4 +93,29 @@ pub fn compute_gradient_correlation(
     }
 
     cov / (var_test * var_truth).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn degenerate_frames_return_documented_values() {
+        assert_eq!(compute_psnr(&[], &[]), f64::INFINITY);
+        assert_eq!(compute_gradient_correlation(&[], &[], 0, 0), 0.0);
+        assert_eq!(compute_gradient_correlation(&[], &[], 0, 7), 0.0);
+        assert_eq!(compute_gradient_correlation(&[], &[], 7, 0), 0.0);
+        assert_eq!(
+            compute_gradient_correlation(&[1, 2, 3], &[1, 2, 3], 3, 1),
+            0.0
+        );
+    }
+
+    #[test]
+    fn identical_textured_frames_correlate_fully() {
+        let frame: Vec<u32> = (0..16u32).map(|i| (i * 37) % 251).collect();
+        assert_eq!(compute_psnr(&frame, &frame), f64::INFINITY);
+        let r = compute_gradient_correlation(&frame, &frame, 4, 4);
+        assert!((r - 1.0).abs() < 1e-12, "r = {r}");
+    }
 }
