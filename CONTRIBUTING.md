@@ -13,8 +13,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The crate declares `rust-version = "1.89"`, set by `wide` and
-`safe_arch` in the dependency tree. It is a hard floor, not a
+The crate declares `rust-version = "1.100"`. It is a hard floor, not a
 default-features-only one.
 
 ## What CI runs
